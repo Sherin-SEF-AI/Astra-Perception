@@ -1,62 +1,63 @@
-# 🌠 Astra Perception: High-Performance AI-ADAS Suite
+# Astra Perception: High-Performance AI-ADAS Suite
 
 ![Version](https://img.shields.io/badge/version-2.1.0-cyan)
 ![Platform](https://img.shields.io/badge/platform-linux-lightgrey)
 ![GPU](https://img.shields.io/badge/GPU-RTX%20Enabled-green)
+![Python](https://img.shields.io/badge/python-3.12+-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-**Astra Perception** is a next-generation, distributed Advanced Driver Assistance System (ADAS) specifically engineered for the complexities of unstructured road environments. Built with a Cyber-Minimalist aesthetic, it combines real-time computer vision with intelligent threat analysis to provide a "Glass Cockpit" experience for any vehicle.
+Astra Perception is a high-performance, distributed Advanced Driver Assistance System (ADAS) specifically engineered for the complexities of unstructured road environments. Built with a Cyber-Minimalist aesthetic, it combines real-time computer vision with intelligent threat analysis to provide a "Glass Cockpit" experience for any vehicle.
 
 ---
 
-## 🚀 Unique Selling Points
+## Technical Innovation
 
-### 🇮🇳 Optimized for Indian Road Conditions
-Unlike traditional ADAS that relies on perfect lane markings, Astra uses **Multi-Scale Road Surface Modeling**. It excels on roads with faded markings, potholes, and varied paving by identifying the physical drivable surface rather than just lines.
+### Specialized Road Surface Modeling
+Unlike traditional ADAS that relies on perfect lane markings, Astra uses Multi-Scale Road Surface Modeling. It excels on roads with faded markings, potholes, and varied paving by identifying the physical drivable surface rather than just lines.
 
-### 🧠 AI Temporal Hallucination
-Ever seen a detection box flicker? Astra eliminates this. Our **Hallucination Memory** keeps objects alive for up to 3 frames if the AI momentarily loses them, ensuring warnings are rock-solid and flicker-free.
+### Intelligent Temporal Hallucination
+To solve the issue of detection flickering, the system features a Hallucination Memory. It maintains object persistence for up to 3 frames if the AI momentarily loses visibility, ensuring rock-solid and stable safety warnings.
 
-### 📡 Distributed ECU Architecture
-Mimicking real automotive hardware, the system splits perception and decision-making:
-1.  **AI Lens (Vision Engine)**: Handles raw sensor data and heavy AI inference on GPU.
-2.  **Control ECU (Cockpit)**: A standalone dashboard that receives data via low-latency UDP to manage vehicle logic and path planning.
+### Distributed ECU Architecture
+The system utilizes a modular automotive architecture:
+1. **Vision Engine (AI Lens)**: Manages high-frequency sensor data and heavy AI inference on the GPU.
+2. **Control ECU (Cockpit)**: A standalone terminal that receives perception packets via low-latency UDP to manage vehicle logic and trajectory planning.
 
 ---
 
-## 🛠️ Core Features
+## Core Capabilities
 
 ### 1. High-Precision Perception
-- **Small-Object Mastery**: Powered by **YOLOv8 Small** (upgraded from Nano) for superior detection of distant bikes, pedestrians, and hazards.
-- **Pulsing Cyber-Grid**: A 30 FPS persistent drivable area overlay with dynamic grid-pattern caching for zero CPU overhead.
-- **Surface Sentinel**: Detects potholes and speed bumps using Adaptive Gaussian filtering, cross-referenced with the drivable area mask.
+- **Small-Object Detection**: Powered by YOLOv8 Small for superior tracking of distant motorcycles, pedestrians, and obstacles.
+- **Dynamic Digital HUD**: A 30 FPS persistent drivable area overlay featuring pulsing grid-pattern caching for zero CPU overhead.
+- **Surface Hazard Analysis**: Adaptive Gaussian filtering to pinpoint potholes and speed bumps, cross-referenced with the drivable area mask.
 
-### 2. Intelligent Threat Manager
-- **Kalman Filter Smoothing**: Predicts trajectories and smooths distance/velocity data.
-- **Intent Analysis**: Automatically detects "Cut-In" maneuvers from the side before they become an immediate danger.
-- **Priority Engine**: A smart "Single-Voice" system that only alerts you to the #1 most critical threat, avoiding beeping fatigue.
+### 2. Threat Management
+- **Trajectory Smoothing**: Integrated Kalman Filters for precise distance and velocity prediction.
+- **Predictive Intent**: Automatic detection of "Cut-In" maneuvers from the side before they enter the vehicle's direct path.
+- **Priority Resolution**: A smart logic engine that isolates the single most critical threat to prevent alert fatigue.
 
 ### 3. Level 1 Control Simulation
-- **Virtual Actuators**: Real-time PID controllers for simulated Steering and Acceleration.
-- **Top-Down Radar**: A tactical 2D visualization with motion trails for all tracked objects.
+- **Virtual Actuators**: Real-time PID controllers for simulated steering and acceleration/braking response.
+- **Tactical Radar**: A 2D spatial visualization dashboard featuring motion trails for all tracked objects.
 
 ---
 
-## 💻 Technical Stack
+## Technical Stack
 
-- **AI Inference**: Ultralytics YOLOv8 (GPU / CUDA / FP16)
-- **Tracking**: Kalman-Filtered Centroid Tracking + Hallucination Memory
-- **CV Math**: OpenCV (LAB Color Space, L1 Manhattan Distance Optimization)
+- **Inference**: Ultralytics YOLOv8 (GPU / CUDA / FP16)
+- **Tracking**: Kalman-Filtered Centroid Tracking with Persistence Memory
+- **Vision Logic**: OpenCV (LAB Color Space, L1 Manhattan Distance Optimization)
 - **Interface**: PyQt6 with Cyber-Minimalist Glass-Panel CSS
-- **Performance**: Asynchronous Producer-Consumer Pipeline (Multi-threaded)
+- **Concurrency**: Asynchronous Multi-threaded Producer-Consumer Pipeline
 
 ---
 
-## ⚡ Quick Start
+## Installation and Deployment
 
 ### Prerequisites
-- Python 3.12+
-- NVIDIA GPU with CUDA 12 support (Fallbacks to high-performance CPU mode automatically)
+- Python 3.12 or higher
+- NVIDIA GPU with CUDA 12 support (Automatic high-performance CPU fallback)
 
 ### Installation
 ```bash
@@ -67,17 +68,17 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Launch Modes
-Access three distinct launch modes from your application menu:
-- **Vision: AI Lens**: The primary perception engine.
-- **Drive: Control ECU**: The standalone radar and cockpit dashboard.
-- **Nexus: Full Stack**: Launches the entire integrated system with one click.
+### Launch Configurations
+The suite provides three distinct operational modes accessible via the application menu:
+- **Vision Engine**: The primary perception and AI analysis module.
+- **Control ECU**: The standalone radar and cockpit telemetry dashboard.
+- **Integrated Stack**: Simultaneous launch of the complete perception and control system.
 
 ---
 
-## 🤝 Author
+## Author
 **Sherin Joseph Roy**
-*Professional AI Engineer Specializing in Autonomous Systems*
+Professional AI Engineer specializing in Autonomous Systems and Computer Vision.
 
-## 📜 License
+## License
 Distributed under the MIT License. See `LICENSE` for more information.
