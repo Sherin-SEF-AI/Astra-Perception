@@ -122,6 +122,63 @@ class VoiceAlertThread(QThread):
         self._run_flag = False
         self.wait()
 
+class VideoCaptureThread(threading.Thread):
+    """Dedicated thread for non-blocking camera I/O"""
+    def __init__(self, source):
+        super().__init__(daemon=True)
+        self.source = source
+        self.ret = False
+        self.frame = None
+        self.running = True
+        
+        print(f"DEBUG: Attempting to open camera: {source}")
+        
+        # Strategy: Try specific backends for better compatibility
+        if isinstance(source, int):
+            # Try V4L2 first on Linux, then default
+            self.cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+            if not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(source)
+        elif isinstance(source, str) and source.startswith("http"):
+            # IP Camera
+            self.cap = cv2.VideoCapture(source)
+        else:
+            # Fallback
+            self.cap = cv2.VideoCapture(source)
+            
+        if self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            print(f"DEBUG: Camera {source} opened successfully")
+        else:
+            print(f"DEBUG: CRITICAL - Failed to open camera {source}")
+
+    def run(self):
+        retry_count = 0
+        while self.running:
+            self.ret, self.frame = self.cap.read()
+            if not self.ret:
+                retry_count += 1
+                # Try to reconnect every 2 seconds if connection is lost
+                if retry_count > 20:
+                    self.cap.release()
+                    time.sleep(2.0)
+                    self.cap = cv2.VideoCapture(self.source)
+                    retry_count = 0
+                else:
+                    time.sleep(0.1)
+            else:
+                retry_count = 0
+
+    def read(self):
+        return self.ret, self.frame
+
+    def stop(self):
+        self.running = False
+        self.cap.release()
+
 class CameraThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
     metrics_signal = pyqtSignal(float, int, str)
@@ -185,23 +242,26 @@ class CameraThread(QThread):
                 obj_results = self.last_results
                 if frame_count % 2 == 0:
                     if self.mode == "ADAS" and self.detector:
-                        obj_results = self.detector.detect(frame)
+                        # Use last known mask for spatial filtering
+                        mask = self.drivable_detector.last_mask if self.drivable_detector else None
+                        obj_results = self.detector.detect(frame, drivable_mask=mask)
                 
                 # 2. Run Drivable Area Detection EVERY frame
-                da_frame = frame
-                da_status = "N/A"
+                da_mask = None
+                da_status = "Searching..."
                 if self.mode == "ADAS" and self.drivable_detector:
                     obj_boxes = [r['box'] for r in obj_results]
-                    da_frame, da_status = self.drivable_detector.detect_and_draw(frame, obj_boxes)
+                    da_mask, da_status = self.drivable_detector.detect(frame, obj_boxes)
                 
-                # 3. Run Surface Hazard Detection (Potholes/Bumps)
+                # 3. Run Surface Hazard Detection
                 hazards = []
                 if self.mode == "ADAS" and self.hazard_detector:
+                    # Use internal mask from detector
                     mask = self.drivable_detector.last_mask if self.drivable_detector else None
                     hazards = self.hazard_detector.detect(frame, drivable_mask=mask)
                 
                 if not self.result_queue.full():
-                    self.result_queue.put((obj_results, da_frame, da_status, hazards))
+                    self.result_queue.put((obj_results, da_mask, da_status, hazards))
                 
                 self.frame_queue.task_done()
             except Empty:
@@ -287,22 +347,20 @@ class CameraThread(QThread):
 
     def run(self):
         source = self.camera_index
-        if isinstance(source, str) and source.startswith("http"):
-            cap = cv2.VideoCapture(source)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        else:
+        # Try to convert to int if it's a numeric string
+        if isinstance(source, str) and not source.startswith("http"):
             try:
                 source = int(source)
-                cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except:
-                cap = cv2.VideoCapture(source)
+                pass
+        
+        self.cap_thread = VideoCaptureThread(source)
+        self.cap_thread.start()
+        time.sleep(0.5) # Give it a moment to start
 
-        if not cap.isOpened():
+        if not self.cap_thread.ret:
             self.error_signal.emit(f"Failed to open camera {source}")
+            self.cap_thread.stop()
             return
 
         # Start the inference thread
@@ -311,17 +369,26 @@ class CameraThread(QThread):
 
         fps_avg = deque(maxlen=30)
         frame_idx = 0
+        last_metric_time = time.time()
+        
+        # Persistence memory for fluid HUD
+        last_da_mask = None
+        last_hazards = []
         
         while self._run_flag:
-            start_time = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                break
+            ret, frame = self.cap_thread.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
             
             frame_idx += 1
-            # Skip UI processing on odd frames for extreme FPS boost
-            if frame_idx % 2 != 0:
-                continue
+            
+            # Accurate FPS: Measure time for 30 frames and divide
+            if frame_idx % 30 == 0:
+                now = time.time()
+                elapsed = now - last_metric_time
+                self.avg_fps_val = 30.0 / elapsed if elapsed > 0 else 0
+                last_metric_time = now
 
             lane_status = "N/A"
             # 1. Submit frame for object detection
@@ -330,19 +397,25 @@ class CameraThread(QThread):
                     self.frame_queue.put(frame.copy())
                 
                 # Try to get the latest combined results (4-element tuple)
-                hazards = []
                 try:
-                    self.last_results, frame, lane_status, hazards = self.result_queue.get_nowait()
+                    self.last_results, new_mask, da_status, hazards = self.result_queue.get_nowait()
+                    if new_mask is not None: last_da_mask = new_mask
+                    last_hazards = hazards
+                    lane_status = da_status
                 except Empty:
                     pass
                 
-                # 2. Consolidated AI Threat Analysis
+                # 2. Apply Persistent Drivable Area Overlay (Fluid 30+ FPS)
+                if self.drivable_detector and last_da_mask is not None:
+                    frame = self.drivable_detector.draw_overlay(frame, last_da_mask)
+
+                # 3. Consolidated AI Threat Analysis
                 alert_text, threat_level, threat_id = self.threat_analyzer.analyze(self.last_results, frame.shape[1])
                 if alert_text:
                     cooldown = 15 if threat_level <= ThreatLevel.LOW else (8 if threat_level <= ThreatLevel.MEDIUM else 3)
                     self.voice_alert_signal.emit(alert_text, cooldown, threat_id)
 
-                # 3. Draw Object Overlays
+                # 4. Draw Object Overlays
                 for res in self.last_results:
                     box, dist, ttc, cls_id, obj_id = res['box'], res['distance'], res['ttc'], res['class_id'], res.get('id', '')
                     label = self.classes.get(cls_id, 'object')
@@ -352,8 +425,8 @@ class CameraThread(QThread):
                     
                     self.draw_targeting_brackets(frame, box, color, label, dist, ttc)
 
-                # 4. Draw Surface Hazards (Now backgrounded)
-                for h_type, (hx, hy, hw, hh) in hazards:
+                # 5. Draw Surface Hazards
+                for h_type, (hx, hy, hw, hh) in last_hazards:
                     cv2.rectangle(frame, (hx, hy), (hx + hw, hy + hh), (255, 0, 255), 2)
                     cv2.putText(frame, h_type, (hx, hy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
                     self.voice_alert_signal.emit(f"{h_type} ahead", 20, None)
@@ -368,16 +441,9 @@ class CameraThread(QThread):
                 frame = cv2.flip(frame, 1)
                 lane_status = "Mirror View"
 
-            # Performance Metrics
-            dt = time.time() - start_time
-            fps = 1.0 / dt if dt > 0 else 0
-            fps_avg.append(fps)
-            avg_fps = sum(fps_avg) / len(fps_avg)
-            self.avg_fps_val = avg_fps
-            
-            # (Redundant text removed - now handled in draw_virtual_hud)
+            # (FPS metrics handled at the start of loop for accuracy)
 
-            # 5. Virtual Actuators (Level 1 Control Simulation)
+            # 6. Virtual Actuators (Level 1 Control Simulation)
             now = time.time()
             dt = now - self.last_time
             self.last_time = now
@@ -388,22 +454,17 @@ class CameraThread(QThread):
                                                                     self.drivable_detector.last_path_center_x, dt)
             
             # Speed/Brake
-            # Use most urgent threat from ThreatAnalyzer
-            threat_ttc = 99.0
-            threat_dist = 99.0
+            threat_ttc, threat_dist = 99.0, 99.0
             if threat_id is not None:
                 for res in self.last_results:
                     if res.get('id') == threat_id:
-                        threat_ttc = res['ttc']
-                        threat_dist = res['distance']
+                        threat_ttc = res['ttc']; threat_dist = res['distance']
                         break
             
             self.virtual_accel = self.lon_controller.calculate(threat_ttc, threat_dist, dt)
-            
-            # Draw HUD
             self.draw_virtual_hud(frame, self.virtual_steering, self.virtual_accel)
 
-            # 6. Broadcast Data for Separate Control ECU
+            # 7. Broadcast Data for Separate Control ECU
             try:
                 packet = {
                     "mode": self.mode,
@@ -421,19 +482,19 @@ class CameraThread(QThread):
                             "box": [int(v) for v in r.get('box', [])]
                         } for r in self.last_results
                     ],
-                    "hazards": hazards
+                    "hazards": last_hazards
                 }
                 self.udp_sock.sendto(json.dumps(packet).encode(), self.udp_target)
             except Exception as e:
                 print(f"UDP Broadcast error: {e}")
 
             self.change_pixmap_signal.emit(frame)
-            self.metrics_signal.emit(avg_fps, len(self.last_results), lane_status)
-
-        cap.release()
+            self.metrics_signal.emit(self.avg_fps_val, len(self.last_results), lane_status)
 
     def stop(self):
         self._run_flag = False
+        if hasattr(self, 'cap_thread'):
+            self.cap_thread.stop()
         self.wait()
 
 class ADASMainWindow(QMainWindow):
@@ -502,18 +563,23 @@ class ADASMainWindow(QMainWindow):
         if local_cams:
             for combo in self.camera_combos.values():
                 current = combo.currentText()
-                combo.clear()
-                combo.addItems(local_cams)
-                if current in local_cams: combo.setCurrentText(current)
+                if not current.startswith("http"):
+                    combo.clear()
+                    combo.addItems(local_cams)
+                    if current in local_cams: combo.setCurrentText(current)
+        
+        # Robust scanning for DroidCam and IP Cams
         scan_droidcam(lambda url: self.new_ip_cam_signal.emit(url))
 
     @pyqtSlot(str)
     def add_ip_camera(self, url):
-        combo = self.camera_combos.get("Main ADAS")
-        if combo:
+        # Add to all relevant camera selectors
+        for name, combo in self.camera_combos.items():
             if combo.findText(url) == -1:
                 combo.addItem(url)
-                if "Offline" in self.main_video.text():
+                # Auto-select if the corresponding view is currently offline
+                label = self.main_video if "Main" in name else (self.side_video if "Side" in name else self.rear_video)
+                if "OFFLINE" in label.text().upper():
                     combo.setCurrentText(url)
 
     def setup_camera_controls(self, name, default_idx, mode, label):
@@ -526,7 +592,8 @@ class ADASMainWindow(QMainWindow):
         combo.addItems([str(i) for i in range(11)])
         combo.setCurrentIndex(default_idx if default_idx < combo.count() else 0)
         self.camera_combos[name] = combo
-        fps_lbl, status_lbl = QLabel("0.0"), QLabel("Offline")
+        fps_lbl, status_lbl = QLabel("0.0"), QLabel("READY")
+        status_lbl.setStyleSheet("color: orange;")
         start_btn, stop_btn = QPushButton("Enable"), QPushButton("Disable")
         stop_btn.setEnabled(False)
         start_btn.clicked.connect(lambda: self.start_cam(name, combo, mode, label, start_btn, stop_btn, fps_lbl, status_lbl))

@@ -1,60 +1,83 @@
-# Astra Perception: Advanced AI-Powered ADAS Suite
+# 🌠 Astra Perception: High-Performance AI-ADAS Suite
 
-Astra Perception is a high-performance, distributed Advanced Driver Assistance System (ADAS) specifically engineered for the complexities of unstructured road environments. Built with a Cyber-Minimalist aesthetic, it combines real-time computer vision with intelligent threat analysis to provide a next-generation "Glass Cockpit" experience for any vehicle.
+![Version](https://img.shields.io/badge/version-2.1.0-cyan)
+![Platform](https://img.shields.io/badge/platform-linux-lightgrey)
+![GPU](https://img.shields.io/badge/GPU-RTX%20Enabled-green)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-## Key Highlights
+**Astra Perception** is a next-generation, distributed Advanced Driver Assistance System (ADAS) specifically engineered for the complexities of unstructured road environments. Built with a Cyber-Minimalist aesthetic, it combines real-time computer vision with intelligent threat analysis to provide a "Glass Cockpit" experience for any vehicle.
 
-- **Indian Road Optimized**: Specialized Drivable Area Detection that excels where traditional lane-marking systems fail.
-- **Distributed Architecture**: A modular system featuring a dedicated "AI Lens" for perception and a separate "Control ECU" for vehicle orchestration.
-- **Cyber-Minimalist HUD**: A sleek, high-contrast visual interface designed for maximum information density with zero clutter.
-- **Intelligence at the Edge**: Leverages YOLOv8, ONNX Runtime, and TensorRT for lightning-fast inference on GPU.
+---
 
-## Core Features
+## 🚀 Unique Selling Points
+
+### 🇮🇳 Optimized for Indian Road Conditions
+Unlike traditional ADAS that relies on perfect lane markings, Astra uses **Multi-Scale Road Surface Modeling**. It excels on roads with faded markings, potholes, and varied paving by identifying the physical drivable surface rather than just lines.
+
+### 🧠 AI Temporal Hallucination
+Ever seen a detection box flicker? Astra eliminates this. Our **Hallucination Memory** keeps objects alive for up to 3 frames if the AI momentarily loses them, ensuring warnings are rock-solid and flicker-free.
+
+### 📡 Distributed ECU Architecture
+Mimicking real automotive hardware, the system splits perception and decision-making:
+1.  **AI Lens (Vision Engine)**: Handles raw sensor data and heavy AI inference on GPU.
+2.  **Control ECU (Cockpit)**: A standalone dashboard that receives data via low-latency UDP to manage vehicle logic and path planning.
+
+---
+
+## 🛠️ Core Features
 
 ### 1. High-Precision Perception
-- **Object Detection**: Tracks pedestrians, vehicles, animals (cows, dogs), and traffic signs with frame-by-frame persistence.
-- **Drivable Area Analysis**: Uses multi-scale road modeling and texture-aware filtering to identify safe paths in real-time.
-- **Surface Hazard Detection**: Adaptive Gaussian thresholding to pinpoint potholes and speed bumps even in challenging lighting.
+- **Small-Object Mastery**: Powered by **YOLOv8 Small** (upgraded from Nano) for superior detection of distant bikes, pedestrians, and hazards.
+- **Pulsing Cyber-Grid**: A 30 FPS persistent drivable area overlay with dynamic grid-pattern caching for zero CPU overhead.
+- **Surface Sentinel**: Detects potholes and speed bumps using Adaptive Gaussian filtering, cross-referenced with the drivable area mask.
 
 ### 2. Intelligent Threat Manager
-- **Kalman Filter Tracking**: Smooths distance and velocity data to eliminate jitter and provide stable Time-to-Collision (TTC) metrics.
-- **AI Intent Analysis**: Detects "Cut-In" maneuvers and crossing threats before they enter your direct path.
-- **Consolidated Alerts**: A smart priority engine ensures you only hear the most critical warning at any given moment.
+- **Kalman Filter Smoothing**: Predicts trajectories and smooths distance/velocity data.
+- **Intent Analysis**: Automatically detects "Cut-In" maneuvers from the side before they become an immediate danger.
+- **Priority Engine**: A smart "Single-Voice" system that only alerts you to the #1 most critical threat, avoiding beeping fatigue.
 
 ### 3. Level 1 Control Simulation
-- **Virtual Actuators**: Integrated PID controllers for simulated Steering and Acceleration/Braking.
-- **2D Radar Dashboard**: A standalone ECU dashboard with motion trails and top-down spatial visualization.
+- **Virtual Actuators**: Real-time PID controllers for simulated Steering and Acceleration.
+- **Top-Down Radar**: A tactical 2D visualization with motion trails for all tracked objects.
 
-## Technical Stack
+---
 
-- **Core**: Python 3.12+
-- **AI Inference**: YOLOv8 (Ultralytics), ONNX Runtime (CUDA/TensorRT)
-- **Computer Vision**: OpenCV (LAB Color Space, Adaptive Filtering)
-- **UI Framework**: PyQt6 (Deep-Space Dark Theme)
-- **Communication**: Low-latency UDP Socket Bridge
+## 💻 Technical Stack
 
-## Quick Start
+- **AI Inference**: Ultralytics YOLOv8 (GPU / CUDA / FP16)
+- **Tracking**: Kalman-Filtered Centroid Tracking + Hallucination Memory
+- **CV Math**: OpenCV (LAB Color Space, L1 Manhattan Distance Optimization)
+- **Interface**: PyQt6 with Cyber-Minimalist Glass-Panel CSS
+- **Performance**: Asynchronous Producer-Consumer Pipeline (Multi-threaded)
+
+---
+
+## ⚡ Quick Start
+
+### Prerequisites
+- Python 3.12+
+- NVIDIA GPU with CUDA 12 support (Fallbacks to high-performance CPU mode automatically)
 
 ### Installation
-1. Clone the repository.
-2. Create a virtual environment: `python -m venv .venv`
-3. Install dependencies: `pip install -r requirements.txt`
-4. Ensure CUDA 12 and TensorRT libraries are in your system path.
+```bash
+git clone https://github.com/Sherin-SEF-AI/Astra-Perception.git
+cd Astra-Perception
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-### Launching the Suite
-Astra Perception comes with three integrated launch modes accessible via your desktop menu:
-- **Vision: ADAS AI Lens**: Launches the camera perception engine.
-- **Drive: Control ECU**: Launches the standalone control dashboard.
-- **Nexus: ADAS AI Stack**: Launches the full integrated system.
+### Launch Modes
+Access three distinct launch modes from your application menu:
+- **Vision: AI Lens**: The primary perception engine.
+- **Drive: Control ECU**: The standalone radar and cockpit dashboard.
+- **Nexus: Full Stack**: Launches the entire integrated system with one click.
 
-## Future Roadmap
-- Integration with real CAN bus hardware for physical actuation.
-- Deep Learning-based Semantic Segmentation for road boundaries.
-- V2X (Vehicle-to-Everything) communication support.
+---
 
-## Author
+## 🤝 Author
 **Sherin Joseph Roy**
-Professional AI Engineer specializing in Autonomous Systems and Computer Vision.
+*Professional AI Engineer Specializing in Autonomous Systems*
 
-## License
+## 📜 License
 Distributed under the MIT License. See `LICENSE` for more information.
