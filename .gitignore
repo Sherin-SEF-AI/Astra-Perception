@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+trt_cache/
+yolov8n.onnx
+yolov8n.pt
+*.engine
+.gemini/
