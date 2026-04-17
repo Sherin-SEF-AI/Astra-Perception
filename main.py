@@ -61,7 +61,7 @@ class ThreatAnalyzer:
             if ttc < 1.8 and (is_ahead or is_cutting_in):
                 level = ThreatLevel.URGENT
                 alert_text = "BRAKE NOW" if ttc < 1.0 else "Emergency: Collision danger"
-                score = 100 / ttc
+                score = 100 / (ttc + 0.01)
             elif is_cutting_in and dist < 12:
                 level = ThreatLevel.HIGH
                 alert_text = "Vehicle cutting in"
@@ -216,12 +216,12 @@ class CameraThread(QThread):
         if mode == "ADAS":
             self.drivable_detector = DrivableAreaDetector(vehicle_mode=self.vehicle_mode)
             self.hazard_detector = SurfaceHazardDetector()
-            model_path = "yolov8n.onnx"
+            model_path = "yolov8s.pt"
             if os.path.exists(model_path):
                 try:
                     self.detector = ObjectDetector(model_path)
                 except Exception as e:
-                    print(f"Error loading ONNX model: {e}")
+                    print(f"Error loading model: {e}")
             self.classes = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle',
                            5: 'bus', 7: 'truck', 9: 'traffic light', 11: 'stop sign',
                            15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant'}
@@ -302,7 +302,7 @@ class CameraThread(QThread):
         
         # 1. Telemetry Panel (Top Left)
         self.draw_glass_panel(frame, 15, 15, 200, 95, alpha=0.4)
-        gpu_status = "ON" if self.detector and 'CPU' not in str(self.detector.session.get_providers()[0]) else "OFF"
+        gpu_status = "ON" if self.detector and self.detector.device == 'cuda' else "OFF"
         gpu_color = (0, 255, 0) if gpu_status == "ON" else (100, 100, 100)
         
         cv2.putText(frame, f"SYSTEM: AI-ACTIVE", (25, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
