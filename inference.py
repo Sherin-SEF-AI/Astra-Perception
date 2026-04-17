@@ -93,30 +93,15 @@ class ObjectDetector:
     def __init__(self, model_path="yolov8s.pt", conf_thres=0.4, iou_thres=0.45):
         self.conf_threshold = conf_thres
         self.iou_threshold = iou_thres
-        
-        # Load model to GPU if available
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = YOLO(model_path).to(self.device)
-        print(f"DEBUG: Astra Perception Engine loaded on {self.device.upper()}")
-        
         self.focal_length = 457 
         self.class_dims = {
-            0: (0.5, 1.7),   # person
-            1: (0.8, 1.2),   # bicycle
-            2: (1.8, 1.5),   # car
-            3: (0.8, 1.2),   # motorcycle
-            5: (2.5, 3.5),   # bus
-            7: (2.5, 3.8),   # truck
-            9: (0.3, 0.8),   # traffic light
-            11: (0.7, 0.7),  # stop sign
-            15: (0.4, 0.4),  # cat
-            16: (0.6, 0.6),  # dog
-            17: (1.2, 1.8),  # horse
-            18: (0.9, 1.0),  # sheep
-            19: (2.0, 1.6),  # cow
-            20: (3.0, 3.2)   # elephant
+            0: (0.5, 1.7), 1: (0.8, 1.2), 2: (1.8, 1.5), 3: (0.8, 1.2),
+            5: (2.5, 3.5), 7: (2.5, 3.8), 9: (0.3, 0.8), 11: (0.7, 0.7),
+            15: (0.4, 0.4), 16: (0.6, 0.6), 17: (1.2, 1.8), 18: (0.9, 1.0),
+            19: (2.0, 1.6), 20: (3.0, 3.2)
         }
-        
         self.dist_history = {}
         self.tracker = CentroidTracker(max_disappeared=15)
         self.hallucination_memory = {}
@@ -125,54 +110,36 @@ class ObjectDetector:
         px_w = box[2] - box[0]
         px_h = box[3] - box[1]
         if px_w <= 0 or px_h <= 0: return 0, 99.0
-
         real_w, real_h = self.class_dims.get(class_id, (1.8, 1.5))
-        focal_len = self.focal_length 
-
-        dist_w = (real_w * focal_len) / px_w
-        dist_h = (real_h * focal_len) / px_h
+        dist_w = (real_w * self.focal_length) / px_w
+        dist_h = (real_h * self.focal_length) / px_h
         distance = round((dist_w * 0.4) + (dist_h * 0.6), 1)
-
         ttc = 99.0 
         now = time.time()
         key = object_id if object_id is not None else class_id
-        if key not in self.dist_history:
-            self.dist_history[key] = deque(maxlen=10)
+        if key not in self.dist_history: self.dist_history[key] = deque(maxlen=10)
         self.dist_history[key].append((now, distance))
-
         if len(self.dist_history[key]) >= 3:
             times, dists = zip(*self.dist_history[key])
             dt = times[-1] - times[0]
             if dt > 0:
                 rel_vel = (dists[0] - dists[-1]) / dt 
                 if rel_vel > 0.3: ttc = round(dists[-1] / rel_vel, 1)
-
         return distance, ttc
 
     def detect(self, image, drivable_mask=None):
-        results = self.model.predict(
-            source=image, conf=self.conf_threshold, iou=self.iou_threshold,
-            device=self.device, half=True if self.device == 'cuda' else False, verbose=False
-        )
-
-        if not results or len(results[0].boxes) == 0:
-            return self._handle_hallucinations([])
-
+        results = self.model.predict(source=image, conf=self.conf_threshold, iou=self.iou_threshold, device=self.device, half=(self.device=='cuda'), verbose=False)
+        if not results or len(results[0].boxes) == 0: return self._handle_hallucinations([])
         boxes = results[0].boxes.xyxy.cpu().numpy()
         scores = results[0].boxes.conf.cpu().numpy()
         class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
-        
         orig_h, orig_w = image.shape[:2]
         detected_rects, detection_data = [], []
-        
         for i in range(len(boxes)):
             box = boxes[i].astype(int)
-            mid_y = (box[1] + box[3]) / 2
-            if mid_y < orig_h * 0.4 and class_ids[i] not in [9, 11]: continue
-
+            if (box[1] + box[3]) / 2 < orig_h * 0.4 and class_ids[i] not in [9, 11]: continue
             detected_rects.append([box[0], box[1], box[2], box[3]])
             detection_data.append({'class_id': class_ids[i], 'score': scores[i], 'box': box})
-
         tracked_objects, tracked_velocities = self.tracker.update(detected_rects)
         current_results = []
         for object_id, centroid in tracked_objects.items():
@@ -180,24 +147,14 @@ class ObjectDetector:
             min_dist = 60
             for i, data in enumerate(detection_data):
                 box = data['box']
-                d_centroid = ((box[0] + box[2])/2, (box[1] + box[3])/2)
-                dist = np.linalg.norm(np.array(centroid) - np.array(d_centroid))
-                if dist < min_dist:
-                    min_dist = dist
-                    best_match_idx = i
-            
+                dist = np.linalg.norm(np.array(centroid) - np.array(((box[0]+box[2])/2, (box[1]+box[3])/2)))
+                if dist < min_dist: min_dist = dist; best_match_idx = i
             if best_match_idx != -1:
                 data = detection_data[best_match_idx]
                 box = data['box']
                 dist_val, ttc = self.estimate_distance(box, data['class_id'], object_id)
-                res = {
-                    'id': object_id, 'box': [box[0], box[1], box[2], box[3]],
-                    'class_id': data['class_id'], 'score': data['score'],
-                    'distance': dist_val, 'ttc': ttc, 'vx': tracked_velocities.get(object_id, (0,0))[0]
-                }
-                current_results.append(res)
-                self.hallucination_memory[object_id] = (res, 0)
-        
+                res = {'id': object_id, 'box': [box[0], box[1], box[2], box[3]], 'class_id': data['class_id'], 'score': data['score'], 'distance': dist_val, 'ttc': ttc, 'vx': tracked_velocities.get(object_id, (0,0))[0]}
+                current_results.append(res); self.hallucination_memory[object_id] = (res, 0)
         return self._handle_hallucinations(current_results)
 
     def _handle_hallucinations(self, current_results):
@@ -209,14 +166,11 @@ class ObjectDetector:
                 if missed_count < 3:
                     self.hallucination_memory[obj_id] = (data, missed_count + 1)
                     final_results.append(data)
-                else:
-                    del self.hallucination_memory[obj_id]
+                else: del self.hallucination_memory[obj_id]
         return final_results
 
 class SurfaceHazardDetector:
-    def __init__(self):
-        self.hazard_history = deque(maxlen=10)
-
+    def __init__(self): self.hazard_history = deque(maxlen=10)
     def detect(self, image, drivable_mask=None):
         height, width = image.shape[:2]
         roi_y1, roi_y2 = int(height * 0.65), int(height * 0.95)
@@ -230,16 +184,12 @@ class SurfaceHazardDetector:
         cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         hazards = []
         for c in cnts:
-            area = cv2.contourArea(c)
-            if 400 < area < 8000:
+            if 400 < cv2.contourArea(c) < 8000:
                 (x, y, w, h) = cv2.boundingRect(c)
                 if 0.6 < w/float(h) < 2.5:
                     fx, fy = x + roi_x1, y + roi_y1
                     if drivable_mask is not None and drivable_mask[fy + h//2, fx + w//2] == 0: continue
-                    roi_edges = edges[y:y+h, x:x+w]
-                    if (np.sum(roi_edges == 255) / (w * h)) > 0.05:
-                        hazards.append(("Pothole", (fx, fy, w, h)))
-
+                    if (np.sum(edges[y:y+h, x:x+w] == 255) / (w * h)) > 0.05: hazards.append(("Pothole", (fx, fy, w, h)))
         hls = cv2.cvtColor(roi, cv2.COLOR_BGR2HLS)
         yellow = cv2.inRange(hls, np.array([15, 40, 80]), np.array([35, 200, 255]))
         white = cv2.inRange(hls, np.array([0, 180, 0]), np.array([180, 255, 255]))
@@ -248,8 +198,7 @@ class SurfaceHazardDetector:
             (x, y, w, h) = cv2.boundingRect(c)
             if w > 80 and h < 50:
                 fx, fy = x + roi_x1, y + roi_y1
-                if drivable_mask is None or drivable_mask[fy + h//2, fx + w//2] != 0:
-                    hazards.append(("Speed Bump", (fx, fy, w, h)))
+                if drivable_mask is None or drivable_mask[fy + h//2, fx + w//2] != 0: hazards.append(("Speed Bump", (fx, fy, w, h)))
         return hazards
 
 class MotionDetector:
@@ -263,17 +212,14 @@ class MotionDetector:
         motion = False
         for c in cnts:
             if cv2.contourArea(c) >= 500:
-                (x, y, w, h) = cv2.boundingRect(c)
-                cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                motion = True
+                (x, y, w, h) = cv2.boundingRect(c); cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2); motion = True
         return image, motion
 
 class DrivableAreaDetector:
     def __init__(self, vehicle_mode="Scooter"):
         self.vehicle_mode = vehicle_mode; self.history = deque(maxlen=5)
         self.last_path_center_x = None; self.last_mask = None; self.grid_cache = None
-        self.last_trajectory = []
-        self.recommended_speed = "60 km/h"
+        self.last_trajectory = []; self.recommended_speed = "60 km/h"
     def _create_grid(self, h, w):
         grid = np.zeros((h, w, 3), dtype=np.uint8)
         for i in range(0, h, 15): cv2.line(grid, (0, i), (w, i), (0, 255, 0), 1)
@@ -283,9 +229,7 @@ class DrivableAreaDetector:
         height, width = image.shape[:2]; scale = 0.25
         small = cv2.resize(image, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
         sh, sw = small.shape[:2]
-        samples = [small[int(sh*0.75):int(sh*0.85), int(sw*0.45):int(sw*0.55)],
-                   small[int(sh*0.70):int(sh*0.80), int(sw*0.30):int(sw*0.40)],
-                   small[int(sh*0.70):int(sh*0.80), int(sw*0.60):int(sw*0.70)]]
+        samples = [small[int(sh*0.75):int(sh*0.85), int(sw*0.45):int(sw*0.55)], small[int(sh*0.70):int(sh*0.80), int(sw*0.30):int(sw*0.40)], small[int(sh*0.70):int(sh*0.80), int(sw*0.60):int(sw*0.70)]]
         valid = [s for s in samples if s.size > 0]
         if not valid: return None, "Searching..."
         labs = [cv2.cvtColor(s, cv2.COLOR_BGR2LAB) for s in valid]
@@ -293,8 +237,7 @@ class DrivableAreaDetector:
         lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB); gray = lab[:,:,0].astype(np.uint8)
         tex = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0)) + np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1))
         dist = 0.2 * np.abs(lab[:,:,0]-ml) + 1.2 * np.abs(lab[:,:,1]-ma) + 1.2 * np.abs(lab[:,:,2]-mb)
-        mask = np.zeros((sh, sw), dtype=np.uint8)
-        mask[(dist < 25.0) & (tex < 60.0)] = 255
+        mask = np.zeros((sh, sw), dtype=np.uint8); mask[(dist < 25.0) & (tex < 60.0)] = 255
         for box in object_boxes:
             x1, y1, x2, y2 = [int(v * scale) for v in box]
             mask[max(0, y1):min(sh, y2), max(0, x1):min(sw, x2)] = 0
@@ -302,31 +245,18 @@ class DrivableAreaDetector:
         cnts, _ = cv2.findContours(cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         valid_cnts = [c for c in cnts if cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] >= sh * 0.8]
         if valid_cnts:
-            largest = max(valid_cnts, key=cv2.contourArea); dms = np.zeros((sh, sw), dtype=np.uint8)
-            cv2.drawContours(dms, [largest], -1, 255, -1)
+            largest = max(valid_cnts, key=cv2.contourArea); dms = np.zeros((sh, sw), dtype=np.uint8); cv2.drawContours(dms, [largest], -1, 255, -1)
             M = cv2.moments(largest)
             if M["m00"] != 0: self.last_path_center_x = int(M["m10"]/M["m00"]) * (1/scale)
-            
-            # Trajectory Logic: Slices at 90%, 75%, 60% and 45% depth
             path_pts = []
             for y_pct in [0.90, 0.75, 0.60, 0.45]:
-                y_idx = int(sh * y_pct)
-                row = dms[y_idx, :]
-                coords = np.where(row == 255)[0]
-                if len(coords) > 0:
-                    path_pts.append((int(np.mean(coords) * (1/scale)), int(y_idx * (1/scale))))
-            
+                y_idx = int(sh * y_pct); row = dms[y_idx, :]; coords = np.where(row == 255)[0]
+                if len(coords) > 0: path_pts.append((int(np.mean(coords) * (1/scale)), int(y_idx * (1/scale))))
             if len(path_pts) >= 3:
-                self.last_trajectory = path_pts
-                # Curvature sensing: horizontal delta between path start and end
-                dx = abs(path_pts[-1][0] - path_pts[0][0])
-                if dx < width * 0.05:
-                    self.recommended_speed = "60 km/h"
-                elif dx < width * 0.15:
-                    self.recommended_speed = "45 km/h"
-                else:
-                    self.recommended_speed = "25 km/h (Curve)"
-            
+                self.last_trajectory = path_pts; dx = abs(path_pts[-1][0] - path_pts[0][0])
+                if dx < width * 0.05: self.recommended_speed = "60 km/h"
+                elif dx < width * 0.15: self.recommended_speed = "45 km/h"
+                else: self.recommended_speed = "25 km/h (Curve)"
             full = cv2.resize(dms, (width, height), interpolation=cv2.INTER_LINEAR); self.history.append(full)
             if len(self.history) >= 2:
                 sm = np.zeros_like(full, dtype=np.float32)
@@ -334,44 +264,23 @@ class DrivableAreaDetector:
                 full = (sm / len(self.history)).astype(np.uint8)
             self.last_mask = full; return full, "Drivable Area OK"
         return None, "Searching..."
+
     def draw_overlay(self, image, mask):
         if mask is None: return image
         h, w = image.shape[:2]
         if self.grid_cache is None or self.grid_cache.shape[:2] != (h, w): self.grid_cache = self._create_grid(h, w)
-        
-        # Enhanced Pulsing logic (higher floor for visibility)
-        pulse = (math.sin(time.time()*5)+1.5)/2.5 
-        overlay = image.copy()
-        
-        # Vibrant Neon Green base for better visibility
-        overlay[mask > 127] = [0, 255, 0] 
-        
-        # Add grid with improved contrast
-        grid_part = (self.grid_cache.astype(np.float32) * pulse).astype(np.uint8)
-        cv2.add(overlay, grid_part, dst=overlay, mask=mask)
-        
-        # Increased alpha from 0.12 to 0.30 for much better "pop"
+        pulse = (math.sin(time.time()*5)+1.5)/2.5; overlay = image.copy(); overlay[mask > 127] = [0, 255, 0]
+        cv2.add(overlay, (self.grid_cache.astype(np.float32) * pulse).astype(np.uint8), dst=overlay, mask=mask)
         res = cv2.addWeighted(image, 0.7, overlay, 0.3, 0)
-        
-        # 7. Draw Trajectory Line (Bézier Curve)
         if hasattr(self, 'last_trajectory') and self.last_trajectory and len(self.last_trajectory) >= 3:
-            pts = self.last_trajectory
-            # Simple quadratic bezier through points
-            p0, p1, p2 = pts[0], pts[len(pts)//2], pts[-1]
-            curve_pts = []
+            pts = self.last_trajectory; p0, p1, p2 = pts[0], pts[len(pts)//2], pts[-1]; curve_pts = []
             for t in np.linspace(0, 1, 25):
                 tx = int((1-t)**2 * p0[0] + 2*(1-t)*t * p1[0] + t**2 * p2[0])
-                ty = int((1-t)**2 * p0[1] + 2*(1-t)*t * p1[1] + t**2 * p2[1])
-                curve_pts.append((tx, ty))
-            
-            for i in range(len(curve_pts)-1):
-                cv2.line(res, curve_pts[i], curve_pts[i+1], (0, 255, 255), 3)
-            
-            # Safe speed recommendation pill
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            txt = f"ADV ADAS | REC SPEED: {self.recommended_speed}"
-            (tw, th), _ = cv2.getTextSize(txt, font, 0.5, 2)
-            cv2.rectangle(res, (w//2 - tw//2 - 10, h - 50), (w//2 + tw//2 + 10, h - 20), (0, 0, 0), -1)
-            cv2.putText(res, txt, (w//2 - tw//2, h - 30), font, 0.5, (0, 255, 255), 2)
-            
+                ty = int((1-t)**2 * p0[1] + 2*(1-t)*t * p1[1] + t**2 * p2[1]); curve_pts.append((tx, ty))
+            for i in range(len(curve_pts)-1): cv2.line(res, curve_pts[i], curve_pts[i+1], (0, 255, 255), 3)
+            font, txt = cv2.FONT_HERSHEY_SIMPLEX, f"ASTRA | REC SPEED: {self.recommended_speed}"
+            (tw, th), _ = cv2.getTextSize(txt, font, 0.45, 1)
+            cv2.rectangle(res, (w//2 - tw//2 - 10, h - 45), (w//2 + tw//2 + 10, h - 15), (20, 20, 25), -1)
+            cv2.rectangle(res, (w//2 - tw//2 - 10, h - 45), (w//2 + tw//2 + 10, h - 15), (0, 255, 255), 1)
+            cv2.putText(res, txt, (w//2 - tw//2, h - 25), font, 0.45, (0, 255, 255), 1)
         return res
