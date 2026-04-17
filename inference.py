@@ -260,6 +260,8 @@ class DrivableAreaDetector:
     def __init__(self, vehicle_mode="Scooter"):
         self.vehicle_mode = vehicle_mode; self.history = deque(maxlen=5)
         self.last_path_center_x = None; self.last_mask = None; self.grid_cache = None
+        self.last_trajectory = []
+        self.recommended_speed = "60 km/h"
     def _create_grid(self, h, w):
         grid = np.zeros((h, w, 3), dtype=np.uint8)
         for i in range(0, h, 15): cv2.line(grid, (0, i), (w, i), (0, 255, 0), 1)
@@ -292,6 +294,27 @@ class DrivableAreaDetector:
             cv2.drawContours(dms, [largest], -1, 255, -1)
             M = cv2.moments(largest)
             if M["m00"] != 0: self.last_path_center_x = int(M["m10"]/M["m00"]) * (1/scale)
+            
+            # Trajectory Logic: Slices at 90%, 75%, 60% and 45% depth
+            path_pts = []
+            for y_pct in [0.90, 0.75, 0.60, 0.45]:
+                y_idx = int(sh * y_pct)
+                row = dms[y_idx, :]
+                coords = np.where(row == 255)[0]
+                if len(coords) > 0:
+                    path_pts.append((int(np.mean(coords) * (1/scale)), int(y_idx * (1/scale))))
+            
+            if len(path_pts) >= 3:
+                self.last_trajectory = path_pts
+                # Curvature sensing: horizontal delta between path start and end
+                dx = abs(path_pts[-1][0] - path_pts[0][0])
+                if dx < width * 0.05:
+                    self.recommended_speed = "60 km/h"
+                elif dx < width * 0.15:
+                    self.recommended_speed = "45 km/h"
+                else:
+                    self.recommended_speed = "25 km/h (Curve)"
+            
             full = cv2.resize(dms, (width, height), interpolation=cv2.INTER_LINEAR); self.history.append(full)
             if len(self.history) >= 2:
                 sm = np.zeros_like(full, dtype=np.float32)
@@ -316,4 +339,27 @@ class DrivableAreaDetector:
         cv2.add(overlay, grid_part, dst=overlay, mask=mask)
         
         # Increased alpha from 0.12 to 0.30 for much better "pop"
-        return cv2.addWeighted(image, 0.7, overlay, 0.3, 0)
+        res = cv2.addWeighted(image, 0.7, overlay, 0.3, 0)
+        
+        # 7. Draw Trajectory Line (Bézier Curve)
+        if hasattr(self, 'last_trajectory') and self.last_trajectory and len(self.last_trajectory) >= 3:
+            pts = self.last_trajectory
+            # Simple quadratic bezier through points
+            p0, p1, p2 = pts[0], pts[len(pts)//2], pts[-1]
+            curve_pts = []
+            for t in np.linspace(0, 1, 25):
+                tx = int((1-t)**2 * p0[0] + 2*(1-t)*t * p1[0] + t**2 * p2[0])
+                ty = int((1-t)**2 * p0[1] + 2*(1-t)*t * p1[1] + t**2 * p2[1])
+                curve_pts.append((tx, ty))
+            
+            for i in range(len(curve_pts)-1):
+                cv2.line(res, curve_pts[i], curve_pts[i+1], (0, 255, 255), 3)
+            
+            # Safe speed recommendation pill
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            txt = f"ADV ADAS | REC SPEED: {self.recommended_speed}"
+            (tw, th), _ = cv2.getTextSize(txt, font, 0.5, 2)
+            cv2.rectangle(res, (w//2 - tw//2 - 10, h - 50), (w//2 + tw//2 + 10, h - 20), (0, 0, 0), -1)
+            cv2.putText(res, txt, (w//2 - tw//2, h - 30), font, 0.5, (0, 255, 255), 2)
+            
+        return res

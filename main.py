@@ -482,7 +482,8 @@ class CameraThread(QThread):
                             "box": [int(v) for v in r.get('box', [])]
                         } for r in self.last_results
                     ],
-                    "hazards": last_hazards
+                    "hazards": last_hazards,
+                    "recommended_speed": self.drivable_detector.recommended_speed if self.drivable_detector else "N/A"
                 }
                 self.udp_sock.sendto(json.dumps(packet).encode(), self.udp_target)
             except Exception as e:

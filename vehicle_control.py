@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPointF
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF
 
-from controllers import LongitudinalController, LateralController
+from controllers import LongitudinalController, LateralController, PhysicsEngine
 
 class ECUReceiver(QThread):
     packet_received = pyqtSignal(dict)
@@ -156,6 +156,111 @@ class SteeringWheelWidget(QWidget):
         painter.setBrush(QBrush(QColor(0, 255, 255)))
         painter.drawEllipse(-4, -74, 8, 8)
 
+class GForceWidget(QWidget):
+    """2D G-Force 'Ball' Meter"""
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(150, 150)
+        self.lat_g = 0.0
+        self.lon_g = 0.0
+        
+    def update_g(self, lat, lon):
+        self.lat_g = lat
+        self.lon_g = lon
+        self.update()
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w // 2, h // 2
+        r = 60
+        
+        # Circle
+        painter.setPen(QPen(QColor(100, 100, 100), 2))
+        painter.drawEllipse(cx - r, cy - r, r*2, r*2)
+        painter.drawLine(cx - r, cy, cx + r, cy)
+        painter.drawLine(cx, cy - r, cx, cy + r)
+        
+        # G-Ball
+        gx = cx + int(self.lat_g * r * 1.5) # Scale G to pixels
+        gy = cy - int(self.lon_g * r * 1.5)
+        
+        # Clamp ball inside circle
+        dist = math.sqrt((gx-cx)**2 + (gy-cy)**2)
+        if dist > r:
+            gx = cx + int((gx-cx) * r / dist)
+            gy = cy + int((gy-cy) * r / dist)
+            
+        painter.setBrush(QBrush(QColor(255, 0, 255)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(gx - 8, gy - 8, 16, 16)
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        painter.drawText(10, 20, f"LAT G: {self.lat_g:.2f}")
+        painter.drawText(10, 40, f"LON G: {self.lon_g:.2f}")
+
+class SpeedometerWidget(QWidget):
+    """Digital Speedometer"""
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(150, 80)
+        self.speed = 0.0 # m/s
+
+    def set_speed(self, speed):
+        self.speed = speed
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        
+        # Background
+        painter.fillRect(self.rect(), QColor(20, 20, 25))
+        
+        # Speed text
+        painter.setPen(QPen(QColor(0, 255, 255)))
+        font = painter.font()
+        font.setPointSize(32)
+        font.setBold(True)
+        painter.setFont(font)
+        
+        kmh = self.speed * 3.6
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"{kmh:.0f}")
+        
+        font.setPointSize(12)
+        painter.setFont(font)
+        painter.drawText(w//2 + 30, h//2 + 10, "KM/H")
+
+class IntensityGraphWidget(QWidget):
+    """Scrolling history graph for braking intensity"""
+    def __init__(self, color=QColor(255, 0, 0)):
+        super().__init__()
+        self.setMinimumSize(200, 100)
+        self.history = deque([0.0]*50, maxlen=50)
+        self.color = color
+
+    def add_value(self, val):
+        self.history.append(abs(val))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(15, 15, 15))
+        
+        painter.setPen(QPen(self.color, 2))
+        pts = []
+        for i, val in enumerate(self.history):
+            x = int(i * (w / 49))
+            y = int(h - (val * h))
+            pts.append(QPointF(x, y))
+        
+        if len(pts) > 1:
+            poly = QPolygonF(pts)
+            painter.drawPolyline(poly)
+
 class ECUDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -166,6 +271,7 @@ class ECUDashboard(QMainWindow):
         # Controllers
         self.lon_controller = LongitudinalController()
         self.lat_controller = LateralController()
+        self.physics = PhysicsEngine()
         self.last_time = time.time()
         
         self.init_ui()
@@ -193,6 +299,10 @@ class ECUDashboard(QMainWindow):
         self.status_lbl.setStyleSheet("color: red; font-size: 18px; font-weight: bold;")
         left_panel.addWidget(self.status_lbl)
         
+        # Telemetry Row 1: Speedometer
+        self.speed_widget = SpeedometerWidget()
+        left_panel.addWidget(self.speed_widget, alignment=Qt.AlignmentFlag.AlignCenter)
+        
         # Steering Section
         self.steer_widget = SteeringWheelWidget()
         left_panel.addWidget(self.steer_widget, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -200,6 +310,15 @@ class ECUDashboard(QMainWindow):
         self.steer_lbl = QLabel("STEERING: 0.0°")
         self.steer_lbl.setStyleSheet("font-size: 20px; color: #00FFFF;")
         left_panel.addWidget(self.steer_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # G-Force Section
+        self.gforce_widget = GForceWidget()
+        left_panel.addWidget(self.gforce_widget, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # Brake Intensity Graph
+        left_panel.addWidget(QLabel("BRAKE INTENSITY"))
+        self.brake_graph = IntensityGraphWidget(color=QColor(255, 50, 0))
+        left_panel.addWidget(self.brake_graph)
         
         # Accel/Brake Bars
         bars_layout = QHBoxLayout()
@@ -227,6 +346,11 @@ class ECUDashboard(QMainWindow):
         
         # RIGHT: Radar / Perception Feedback
         right_panel = QVBoxLayout()
+        
+        self.rec_speed_lbl = QLabel("REC SPEED: 60 km/h")
+        self.rec_speed_lbl.setStyleSheet("font-size: 22px; color: #00FF00; background-color: #1A1A1F; padding: 10px; border-radius: 5px;")
+        right_panel.addWidget(self.rec_speed_lbl)
+        
         right_panel.addWidget(QLabel("PERCEPTION RADAR (2D)"))
         self.radar = RadarWidget()
         right_panel.addWidget(self.radar)
@@ -265,16 +389,25 @@ class ECUDashboard(QMainWindow):
             steering = self.lat_controller.calculate(packet.get('frame_w')//2, 
                                                     packet.get('path_center_x'), dt)
         
-        # 2. Update UI
+        # 2. Physics Inertia Simulation
+        speed, lat_g, lon_g = self.physics.update(accel, steering, dt)
+        
+        # 3. Update UI
         self.steer_widget.set_angle(steering * 45) # Visual scale
         self.steer_lbl.setText(f"STEERING: {steering*45:.1f}°")
-        
+        self.speed_widget.set_speed(speed)
+        self.gforce_widget.update_g(lat_g, lon_g)
+        self.rec_speed_lbl.setText(f"REC SPEED: {packet.get('recommended_speed', '60 km/h')}")
+
         if accel > 0:
             self.throttle_bar.setValue(int(accel * 200)) # Scale for visibility
             self.brake_bar.setValue(0)
+            self.brake_graph.add_value(0)
         else:
             self.throttle_bar.setValue(0)
             self.brake_bar.setValue(int(abs(accel) * 100))
+            self.brake_graph.add_value(abs(accel))
+
             
         self.threat_lbl.setText(f"ACTIVE THREAT: {threat_label}")
         
