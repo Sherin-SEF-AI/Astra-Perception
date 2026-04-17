@@ -243,7 +243,8 @@ class CameraThread(QThread):
         cv2.putText(frame, f"FPS: {self.avg_fps_val:.1f}", (25, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
         cx, cy, r, angle = w // 2, h - 60, 45, steering * 40
         cv2.ellipse(frame, (cx, cy), (r, r), 0, -150, -30, (60, 60, 60), 1)
-        nx, ny = int(cx + r * math.cos(math.radians(angle - 90))), int(cy + r * math.sin(math.radians(angle - 90)))
+        nx = int(cx + r * math.cos(math.radians(angle - 90)))
+        ny = int(cy + r * math.sin(math.radians(angle - 90)))
         cv2.line(frame, (cx, cy), (nx, ny), (0, 255, 255), 2); cv2.circle(frame, (nx, ny), 4, (0, 255, 255), -1)
         cv2.line(frame, (cx, cy-r-5), (cx, cy-r+5), (255, 255, 255), 1)
         bx, by, bw, bh = w - 45, h - 150, 12, 100; self.draw_glass_panel(frame, bx-5, by-10, bw+10, bh+20, alpha=0.3)
@@ -268,8 +269,7 @@ class CameraThread(QThread):
             if frame_idx % 30 == 0:
                 now = time.time(); self.avg_fps_val = 30.0 / (now - last_metric_time); last_metric_time = now
             if frame_idx % 2 != 0: self.change_pixmap_signal.emit(frame); continue
-            lane_status = "N/A"
-            tid = None
+            lane_status = "N/A"; tid = None
             if self.mode == "ADAS":
                 if not self.frame_queue.full(): self.frame_queue.put(frame.copy())
                 try:
@@ -282,8 +282,7 @@ class CameraThread(QThread):
                 if alert: self.voice_alert_signal.emit(alert, 15 if level <= ThreatLevel.LOW else (8 if level <= ThreatLevel.MEDIUM else 3), tid)
                 for r in self.last_results:
                     box, cid, oid = r['box'], r['class_id'], r.get('id', '')
-                    label = self.classes.get(cid, 'object')
-                    color = (0, 255, 0)
+                    label = self.classes.get(cid, 'object'); color = (0, 255, 0)
                     if r.get('id') == tid: color = (0, 0, 255) if level >= ThreatLevel.HIGH else (0, 255, 255)
                     self.draw_targeting_brackets(frame, box, color, label, r['distance'], r['ttc'])
                 for h_type, (hx, hy, hw, hh) in last_hazards:
@@ -361,16 +360,16 @@ class ADASMainWindow(QMainWindow):
     @pyqtSlot(str)
     def add_ip_camera(self, url):
         for name, combo in self.camera_combos.items():
-            if combo.findText(url) == -1:
-                combo.addItem(url)
+            if combo[1].findText(url) == -1:
+                combo[1].addItem(url)
                 label = self.main_video if "Main" in name else (self.side_video if "Side" in name else self.rear_video)
-                if "OFFLINE" in label.text().upper(): combo.setCurrentText(url)
+                if "OFFLINE" in label.text().upper(): combo[1].setCurrentText(url)
 
     def setup_camera_controls(self, name, default_idx, mode, label):
         group = QGroupBox(name); layout = QVBoxLayout(); combo = QComboBox()
         if mode == "ADAS": combo.setEditable(True); combo.setPlaceholderText("Index or URL")
         combo.addItems([str(i) for i in range(11)]); combo.setCurrentIndex(default_idx if default_idx < combo.count() else 0)
-        self.camera_combos[name] = combo
+        self.camera_combos[name] = (mode, combo)
         status_row = QHBoxLayout(); status_lbl = QLabel("READY"); status_lbl.setStyleSheet("color: orange;"); fps_lbl = QLabel("0.0")
         status_row.addWidget(status_lbl); status_row.addStretch(); status_row.addWidget(QLabel("FPS:")); status_row.addWidget(fps_lbl); layout.addLayout(status_row)
         cb_obj, cb_path, cb_haz = None, None, None
