@@ -67,8 +67,8 @@ class CentroidTracker:
                                                            [np.float32(input_centroids[col][1])]], np.float32))
                 prediction = self.kf_filters[object_id].predict()
                 
-                self.objects[object_id] = (int(prediction[0]), int(prediction[1]))
-                object_velocities[object_id] = (float(prediction[2]), float(prediction[3]))
+                self.objects[object_id] = (int(prediction[0].item()), int(prediction[1].item()))
+                object_velocities[object_id] = (float(prediction[2].item()), float(prediction[3].item()))
                 
                 self.disappeared[object_id] = 0
                 used_rows.add(row)
@@ -105,6 +105,7 @@ class ObjectDetector:
         self.dist_history = {}
         self.tracker = CentroidTracker(max_disappeared=15)
         self.hallucination_memory = {}
+        self._cleanup_counter = 0
 
     def estimate_distance(self, box, class_id, object_id=None):
         px_w = box[2] - box[0]
@@ -128,6 +129,13 @@ class ObjectDetector:
         return distance, ttc
 
     def detect(self, image, drivable_mask=None):
+        # Periodic cleanup of stale tracking data to prevent memory leaks
+        self._cleanup_counter += 1
+        if self._cleanup_counter % 100 == 0:
+            active_ids = set(self.tracker.objects.keys())
+            self.dist_history = {k: v for k, v in self.dist_history.items() if k in active_ids}
+            self.hallucination_memory = {k: v for k, v in self.hallucination_memory.items() if k in active_ids or v[1] < 3}
+
         results = self.model.predict(source=image, conf=self.conf_threshold, iou=self.iou_threshold, device=self.device, half=(self.device=='cuda'), verbose=False)
         if not results or len(results[0].boxes) == 0: return self._handle_hallucinations([])
         boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -153,7 +161,8 @@ class ObjectDetector:
                 data = detection_data[best_match_idx]
                 box = data['box']
                 dist_val, ttc = self.estimate_distance(box, data['class_id'], object_id)
-                res = {'id': object_id, 'box': [box[0], box[1], box[2], box[3]], 'class_id': data['class_id'], 'score': data['score'], 'distance': dist_val, 'ttc': ttc, 'vx': tracked_velocities.get(object_id, (0,0))[0]}
+                vel = tracked_velocities.get(object_id, (0,0))
+                res = {'id': object_id, 'box': [box[0], box[1], box[2], box[3]], 'class_id': data['class_id'], 'score': data['score'], 'distance': dist_val, 'ttc': ttc, 'vx': vel[0], 'vy': vel[1]}
                 current_results.append(res); self.hallucination_memory[object_id] = (res, 0)
         return self._handle_hallucinations(current_results)
 
@@ -188,7 +197,9 @@ class SurfaceHazardDetector:
                 (x, y, w, h) = cv2.boundingRect(c)
                 if 0.6 < w/float(h) < 2.5:
                     fx, fy = x + roi_x1, y + roi_y1
-                    if drivable_mask is not None and drivable_mask[fy + h//2, fx + w//2] == 0: continue
+                    if drivable_mask is not None:
+                        my, mx = fy + h//2, fx + w//2
+                        if 0 <= my < drivable_mask.shape[0] and 0 <= mx < drivable_mask.shape[1] and drivable_mask[my, mx] == 0: continue
                     if (np.sum(edges[y:y+h, x:x+w] == 255) / (w * h)) > 0.05: hazards.append(("Pothole", (fx, fy, w, h)))
         hls = cv2.cvtColor(roi, cv2.COLOR_BGR2HLS)
         yellow = cv2.inRange(hls, np.array([15, 40, 80]), np.array([35, 200, 255]))
@@ -198,7 +209,12 @@ class SurfaceHazardDetector:
             (x, y, w, h) = cv2.boundingRect(c)
             if w > 80 and h < 50:
                 fx, fy = x + roi_x1, y + roi_y1
-                if drivable_mask is None or drivable_mask[fy + h//2, fx + w//2] != 0: hazards.append(("Speed Bump", (fx, fy, w, h)))
+                if drivable_mask is None:
+                    hazards.append(("Speed Bump", (fx, fy, w, h)))
+                else:
+                    my, mx = fy + h//2, fx + w//2
+                    if 0 <= my < drivable_mask.shape[0] and 0 <= mx < drivable_mask.shape[1] and drivable_mask[my, mx] != 0:
+                        hazards.append(("Speed Bump", (fx, fy, w, h)))
         return hazards
 
 class MotionDetector:

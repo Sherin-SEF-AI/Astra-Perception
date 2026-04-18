@@ -5,6 +5,7 @@ import json
 import socket
 import numpy as np
 import math
+from collections import deque
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QProgressBar, QFrame, QGridLayout
@@ -38,6 +39,10 @@ class ECUReceiver(QThread):
 
     def stop(self):
         self._run_flag = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
         self.wait()
 
 class RadarWidget(QWidget):
@@ -55,7 +60,7 @@ class RadarWidget(QWidget):
         self.threats = threats
         self.threat_id = threat_id
         self.path_x = path_x
-        self.frame_w = frame_w
+        self.frame_w = frame_w if frame_w else 640
         self.hazards = hazards
         self.update()
 
@@ -377,8 +382,8 @@ class ECUDashboard(QMainWindow):
         
         for t in packet.get('threats', []):
             if t.get('id') == threat_id:
-                threat_ttc = t.get('ttc')
-                threat_dist = t.get('dist')
+                threat_ttc = t.get('ttc', 99.0) or 99.0
+                threat_dist = t.get('dist', 99.0) or 99.0
                 threat_label = f"{t.get('cls')} (ID:{threat_id})"
                 break
         
@@ -409,8 +414,17 @@ class ECUDashboard(QMainWindow):
             self.brake_graph.add_value(abs(accel))
 
             
-        self.threat_lbl.setText(f"ACTIVE THREAT: {threat_label}")
-        
+        # Enhanced threat level display with color coding
+        tlevel = packet.get('threat_level', 0)
+        level_colors = {0: "#00FF00", 1: "#88FF00", 2: "#FFFF00", 3: "#FF6600", 4: "#FF0000"}
+        level_names = {0: "CLEAR", 1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "URGENT"}
+        self.threat_lbl.setText(f"THREAT: {level_names.get(tlevel, 'CLEAR')} | {threat_label}")
+        self.threat_lbl.setStyleSheet(f"color: {level_colors.get(tlevel, '#00FF00')}; font-size: 16px; font-weight: bold;")
+
+        # Night mode indicator
+        if packet.get('night_mode', False):
+            self.status_lbl.setText("ECU CONNECTED | NIGHT MODE")
+
         # Update Radar
         self.radar.update_data(packet.get('threats', []), threat_id, 
                                packet.get('path_center_x'), packet.get('frame_w'),
@@ -422,6 +436,11 @@ class ECUDashboard(QMainWindow):
             self.status_lbl.setStyleSheet("color: red;")
             self.throttle_bar.setValue(0)
             self.brake_bar.setValue(0)
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        self.receiver.stop()
+        super().closeEvent(event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

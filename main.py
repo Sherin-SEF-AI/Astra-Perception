@@ -24,10 +24,10 @@ logging.getLogger("ultralytics").setLevel(logging.ERROR)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QGroupBox, QFormLayout, QGridLayout,
-    QCheckBox, QTextEdit
+    QCheckBox, QTextEdit, QToolBar, QSlider
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer
+from PyQt6.QtGui import QImage, QPixmap, QAction
 
 from inference import ObjectDetector, DrivableAreaDetector, MotionDetector, SurfaceHazardDetector
 from utils import scan_droidcam, list_local_cameras
@@ -46,10 +46,11 @@ class ThreatAnalyzer:
         self.last_alert_type = None
         self.last_alert_time = 0
         self.alert_in_progress = False
-        
+
     def analyze(self, results, frame_width):
-        if not results: return None, ThreatLevel.NONE, None
-        
+        """Returns (top_candidates_list, max_threat_level). Each candidate: (score, level, alert_text, object_id)"""
+        if not results: return [], ThreatLevel.NONE
+
         candidates = []
         for res in results:
             box = res['box']
@@ -57,15 +58,15 @@ class ThreatAnalyzer:
             ttc = res['ttc']
             vx = res.get('vx', 0)
             mid_x = (box[0] + box[2]) / 2
-            
+
             is_ahead = (frame_width * 0.3) < mid_x < (frame_width * 0.7)
             is_cutting_in = (mid_x < frame_width * 0.3 and vx > 5) or \
                             (mid_x > frame_width * 0.7 and vx < -5)
-            
+
             score = 0
             level = ThreatLevel.NONE
             alert_text = ""
-            
+
             if ttc < 1.8 and (is_ahead or is_cutting_in):
                 level = ThreatLevel.URGENT
                 alert_text = "BRAKE NOW" if ttc < 1.0 else "Emergency: Collision danger"
@@ -82,13 +83,19 @@ class ThreatAnalyzer:
                 level = ThreatLevel.LOW
                 alert_text = "Close proximity"
                 score = 40 - dist
-                
+
+            # Pedestrian priority boost (class_id 0 = person)
+            if res.get('class_id') == 0 and level > ThreatLevel.NONE:
+                score *= 1.5
+                level = max(level, ThreatLevel.MEDIUM)
+
             if level > ThreatLevel.NONE:
                 candidates.append((score, level, alert_text, res.get('id')))
-        
-        if not candidates: return None, ThreatLevel.NONE, None
+
+        if not candidates: return [], ThreatLevel.NONE
         candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][2], candidates[0][1], candidates[0][3]
+        max_level = candidates[0][1]
+        return candidates[:3], max_level
 
 class VoiceAlertThread(QThread):
     def __init__(self):
@@ -96,7 +103,7 @@ class VoiceAlertThread(QThread):
         self.queue = deque()
         self._run_flag = True
         self.last_alert_time = {}
-        
+
     def run(self):
         engine = pyttsx3.init()
         engine.setProperty('rate', 160)
@@ -107,8 +114,8 @@ class VoiceAlertThread(QThread):
                 try:
                     engine.say(text)
                     engine.runAndWait()
-                except:
-                    pass
+                except Exception as e:
+                    logging.debug(f"TTS error: {e}")
             else:
                 time.sleep(0.1)
 
@@ -131,21 +138,26 @@ class VideoCaptureThread(threading.Thread):
         self.ret = False
         self.frame = None
         self.running = True
+        self.cap = None
         if isinstance(source, int):
             self.cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
-            if not self.cap.isOpened(): self.cap = cv2.VideoCapture(source)
+            if not self.cap.isOpened():
+                self.cap.release()
+                self.cap = cv2.VideoCapture(source)
         elif isinstance(source, str) and source.startswith("http"):
             self.cap = cv2.VideoCapture(source)
         else:
             self.cap = cv2.VideoCapture(source)
-            
-        if self.cap.isOpened():
+
+        if self.cap is not None and self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     def run(self):
+        if self.cap is None or not self.cap.isOpened():
+            return
         retry_count = 0
         while self.running:
             self.ret, self.frame = self.cap.read()
@@ -159,7 +171,10 @@ class VideoCaptureThread(threading.Thread):
             else: retry_count = 0
 
     def read(self): return self.ret, self.frame
-    def stop(self): self.running = False; self.cap.release()
+    def stop(self):
+        self.running = False
+        if self.cap is not None:
+            self.cap.release()
 
 class CameraThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -180,11 +195,20 @@ class CameraThread(QThread):
         self.lon_controller = LongitudinalController(); self.lat_controller = LateralController()
         self.virtual_steering = 0.0; self.virtual_accel = 0.0; self.last_time = time.time()
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); self.udp_target = ('127.0.0.1', 5005)
-        
+        # Recording & screenshot state
+        self.recording = False
+        self.video_writer = None
+        self.screenshot_requested = False
+        # Night mode state
+        self._night_mode_active = False
+        self.night_mode_enabled = True  # auto night mode toggle
+        # Current threat level for HUD
+        self._current_threat_level = ThreatLevel.NONE
+
         if mode == "ADAS":
             self.drivable_detector = DrivableAreaDetector(vehicle_mode=self.vehicle_mode)
             self.hazard_detector = SurfaceHazardDetector()
-            model_path = "yolov8s.pt"
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8s.pt")
             if os.path.exists(model_path):
                 try: self.detector = ObjectDetector(model_path)
                 except Exception as e: print(f"Error loading model: {e}")
@@ -207,40 +231,95 @@ class CameraThread(QThread):
                 if self.enable_drivable and self.drivable_detector:
                     obj_boxes = [r['box'] for r in obj_results]
                     da_mask, da_status = self.drivable_detector.detect(frame, obj_boxes)
-                
+
                 hazards = []
                 if self.enable_hazards and self.hazard_detector:
                     mask = self.drivable_detector.last_mask if self.drivable_detector else None
                     hazards = self.hazard_detector.detect(frame, drivable_mask=mask)
                     if hazards: self.log_signal.emit(f"Alert: {hazards[0][0]} detected")
-                
-                if not self.result_queue.full(): self.result_queue.put((obj_results, da_mask, da_status, hazards))
+
+                if not self.result_queue.full():
+                    self.result_queue.put((obj_results, da_mask, da_status, hazards))
                 self.frame_queue.task_done()
             except Empty: continue
+
+    def apply_night_mode(self, frame):
+        """Auto-detect low light and apply histogram equalization"""
+        if not self.night_mode_enabled:
+            self._night_mode_active = False
+            return frame
+        brightness = np.mean(frame)
+        if brightness < 60:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            lab[:, :, 0] = cv2.equalizeHist(lab[:, :, 0])
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            self._night_mode_active = True
+        else:
+            self._night_mode_active = False
+        return frame
 
     def draw_glass_panel(self, frame, x, y, w, h, color=(40, 40, 40), alpha=0.6):
         overlay = frame.copy(); cv2.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         cv2.rectangle(frame, (x, y), (x + w, y + h), (100, 100, 100), 1)
 
-    def draw_targeting_brackets(self, frame, box, color, label, dist, ttc):
+    def draw_targeting_brackets(self, frame, box, color, label, dist, ttc, score=0, vx=0, vy=0, threat_rank=-1):
         x1, y1, x2, y2 = box; l = int(min(x2-x1, y2-y1) * 0.2)
         cv2.line(frame, (x1, y1), (x1+l, y1), color, 2); cv2.line(frame, (x1, y1), (x1, y1+l), color, 2)
         cv2.line(frame, (x2, y1), (x2-l, y1), color, 2); cv2.line(frame, (x2, y1), (x2, y1+l), color, 2)
         cv2.line(frame, (x1, y2), (x1+l, y2), color, 2); cv2.line(frame, (x1, y2), (x1, y2-l), color, 2)
         cv2.line(frame, (x2, y2), (x2-l, y2), color, 2); cv2.line(frame, (x2, y2), (x2, y2-l), color, 2)
-        font = cv2.FONT_HERSHEY_SIMPLEX; text = f"{label.upper()} {dist}m"; (tw, th), _ = cv2.getTextSize(text, font, 0.4, 1)
+
+        # Enhanced label with confidence score
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        conf_pct = int(score * 100) if isinstance(score, float) and score <= 1.0 else int(score)
+        text = f"{label.upper()} {dist}m [{conf_pct}%]"
+        (tw, th), _ = cv2.getTextSize(text, font, 0.4, 1)
         self.draw_glass_panel(frame, x1, y1-th-10, tw+10, th+8, color=(0,0,0), alpha=0.5)
         cv2.putText(frame, text, (x1+5, y1-7), font, 0.4, (255, 255, 255), 1)
 
+        # Velocity arrow (drawn if object has significant lateral motion)
+        if abs(vx) > 2:
+            mid_x = (x1 + x2) // 2
+            mid_y = (y1 + y2) // 2
+            end_x = mid_x + int(vx * 3)
+            end_y = mid_y + int(vy * 3) if abs(vy) > 2 else mid_y
+            cv2.arrowedLine(frame, (mid_x, mid_y), (end_x, end_y), (255, 255, 0), 2, tipLength=0.3)
+
+        # Threat rank badge
+        if threat_rank >= 0:
+            badge_text = f"#{threat_rank + 1}"
+            bx, by = x2 - 25, y1 - 8
+            cv2.circle(frame, (bx, by), 12, color, -1)
+            cv2.putText(frame, badge_text, (bx - 8, by + 5), font, 0.4, (255, 255, 255), 1)
+
     def draw_virtual_hud(self, frame, steering, accel):
-        h, w = frame.shape[:2]; self.draw_glass_panel(frame, 15, 15, 200, 95, alpha=0.4)
+        h, w = frame.shape[:2]; self.draw_glass_panel(frame, 15, 15, 210, 115, alpha=0.4)
         gpu = "ON" if self.detector and self.detector.device == 'cuda' else "OFF"
         gc = (0, 255, 0) if gpu == "ON" else (100, 100, 100)
         cv2.putText(frame, f"SYSTEM: AI-ACTIVE", (25, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         cv2.putText(frame, f"MODE: {self.mode}", (25, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         cv2.putText(frame, f"GPU: {gpu}", (25, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.4, gc, 1)
         cv2.putText(frame, f"FPS: {self.avg_fps_val:.1f}", (25, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        # Night mode indicator
+        if self._night_mode_active:
+            cv2.putText(frame, "NIGHT", (25, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 0), 1)
+
+        # Threat level badge (top-right)
+        badge_colors = {0: (100,100,100), 1: (0,200,0), 2: (0,255,255), 3: (0,165,255), 4: (0,0,255)}
+        badge_labels = {0: "CLEAR", 1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "URGENT"}
+        bc = badge_colors.get(int(self._current_threat_level), (100,100,100))
+        bl = badge_labels.get(int(self._current_threat_level), "CLEAR")
+        self.draw_glass_panel(frame, w - 170, 15, 155, 30, alpha=0.5)
+        cv2.putText(frame, f"THREAT: {bl}", (w - 165, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bc, 2)
+
+        # Detection count badge (below threat)
+        count = len(self.last_results)
+        if count > 0:
+            self.draw_glass_panel(frame, w - 100, 50, 85, 25, alpha=0.4)
+            cv2.putText(frame, f"OBJ: {count}", (w - 95, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
+
+        # Steering wheel mini indicator
         cx, cy, r, angle = w // 2, h - 60, 45, steering * 40
         cv2.ellipse(frame, (cx, cy), (r, r), 0, -150, -30, (60, 60, 60), 1)
         nx = int(cx + r * math.cos(math.radians(angle - 90)))
@@ -253,13 +332,37 @@ class CameraThread(QThread):
         else:
             ah = int(abs(accel) * bh); cv2.rectangle(frame, (bx, by + bh - ah), (bx + bw, by + bh), (0, 0, 255), -1)
 
+    def draw_following_distance(self, frame, tid):
+        """Draw following distance advisory (3-second rule)"""
+        if tid is None: return
+        for r in self.last_results:
+            if r.get('id') == tid and r['distance'] > 0:
+                # Estimate following time: distance / assumed ego speed (~15 m/s city, ~25 highway)
+                ego_speed = max(5.0, 15.0)
+                following_time = r['distance'] / ego_speed
+                if following_time < 3.0:
+                    h, w = frame.shape[:2]
+                    color = (0, 0, 255) if following_time < 1.5 else (0, 165, 255) if following_time < 2.5 else (0, 255, 255)
+                    self.draw_glass_panel(frame, w//2 - 140, 15, 280, 28, alpha=0.5)
+                    cv2.putText(frame, f"FOLLOWING: {following_time:.1f}s  (MIN 3.0s)",
+                               (w//2 - 130, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                break
+
     def run(self):
         source = self.camera_index
         if isinstance(source, str) and not source.startswith("http"):
             try: source = int(source)
             except: pass
-        self.cap_thread = VideoCaptureThread(source); self.cap_thread.start(); time.sleep(0.5)
-        if not self.cap_thread.ret: self.error_signal.emit(f"Failed: {source}"); self.cap_thread.stop(); return
+        self.cap_thread = VideoCaptureThread(source); self.cap_thread.start()
+        # Wait up to 3 seconds for camera to produce first frame
+        for _ in range(30):
+            if self.cap_thread.ret: break
+            time.sleep(0.1)
+        if not self.cap_thread.ret:
+            self.error_signal.emit(f"Failed to open camera: {source}")
+            self.cap_thread.stop()
+            return
+        self.log_signal.emit(f"Camera {source} connected successfully")
         threading.Thread(target=self.inference_loop, daemon=True).start()
         frame_idx, last_metric_time, last_da_mask, last_hazards = 0, time.time(), None, []
         while self._run_flag:
@@ -268,23 +371,50 @@ class CameraThread(QThread):
             frame_idx += 1
             if frame_idx % 30 == 0:
                 now = time.time(); self.avg_fps_val = 30.0 / (now - last_metric_time); last_metric_time = now
-            if frame_idx % 2 != 0: self.change_pixmap_signal.emit(frame); continue
+
+            # Night mode auto-enhancement
+            frame = self.apply_night_mode(frame)
+
             lane_status = "N/A"; tid = None
             if self.mode == "ADAS":
                 if not self.frame_queue.full(): self.frame_queue.put(frame.copy())
                 try:
                     self.last_results, new_mask, da_status, hazards = self.result_queue.get_nowait()
-                    if new_mask is not None: last_da_mask = new_mask
+                    if new_mask is not None:
+                        last_da_mask = new_mask
                     last_hazards, lane_status = hazards, da_status
                 except Empty: pass
-                if self.drivable_detector and last_da_mask is not None: frame = self.drivable_detector.draw_overlay(frame, last_da_mask)
-                alert, level, tid = self.threat_analyzer.analyze(self.last_results, frame.shape[1])
-                if alert: self.voice_alert_signal.emit(alert, 15 if level <= ThreatLevel.LOW else (8 if level <= ThreatLevel.MEDIUM else 3), tid)
+
+                if self.drivable_detector and last_da_mask is not None:
+                    frame = self.drivable_detector.draw_overlay(frame, last_da_mask)
+
+                # Multi-threat analysis (top 3)
+                top_threats, max_level = self.threat_analyzer.analyze(self.last_results, frame.shape[1])
+                self._current_threat_level = max_level
+                threat_ids = {t[3]: i for i, t in enumerate(top_threats)}  # object_id -> rank
+
+                if top_threats:
+                    tid = top_threats[0][3]
+                    alert_text = top_threats[0][2]
+                    cooldown = 15 if max_level <= ThreatLevel.LOW else (8 if max_level <= ThreatLevel.MEDIUM else 3)
+                    self.voice_alert_signal.emit(alert_text, cooldown, tid)
+
+                # Draw all detections with multi-threat color coding
                 for r in self.last_results:
-                    box, cid, oid = r['box'], r['class_id'], r.get('id', '')
-                    label = self.classes.get(cid, 'object'); color = (0, 255, 0)
-                    if r.get('id') == tid: color = (0, 0, 255) if level >= ThreatLevel.HIGH else (0, 255, 255)
-                    self.draw_targeting_brackets(frame, box, color, label, r['distance'], r['ttc'])
+                    box, cid = r['box'], r['class_id']
+                    label = self.classes.get(cid, 'object')
+                    rank = threat_ids.get(r.get('id'), -1)
+                    if rank == 0: color = (0, 0, 255)       # Red - primary threat
+                    elif rank == 1: color = (0, 165, 255)    # Orange - secondary
+                    elif rank == 2: color = (0, 255, 255)    # Yellow - tertiary
+                    else: color = (0, 255, 0)                # Green - no threat
+                    self.draw_targeting_brackets(frame, box, color, label, r['distance'], r['ttc'],
+                                                 score=r.get('score', 0), vx=r.get('vx', 0),
+                                                 vy=r.get('vy', 0), threat_rank=rank)
+
+                # Following distance advisory
+                self.draw_following_distance(frame, tid)
+
                 for h_type, (hx, hy, hw, hh) in last_hazards:
                     cv2.rectangle(frame, (hx, hy), (hx + hw, hy + hh), (255, 0, 255), 2)
                     self.voice_alert_signal.emit(f"{h_type} ahead", 20, None)
@@ -293,6 +423,7 @@ class CameraThread(QThread):
                 if motion: self.voice_alert_signal.emit("Vehicle in blind spot", 10, None)
                 lane_status = "Blind Spot Active"
             elif self.mode == "DRIVER": frame = cv2.flip(frame, 1); lane_status = "Mirror View"
+
             now = time.time(); dt = now - self.last_time; self.last_time = now
             if self.drivable_detector and self.drivable_detector.last_path_center_x is not None:
                 self.virtual_steering = self.lat_controller.calculate(frame.shape[1]//2, self.drivable_detector.last_path_center_x, dt)
@@ -300,29 +431,91 @@ class CameraThread(QThread):
             if tid is not None:
                 for r in self.last_results:
                     if r.get('id') == tid: tttc, tdist = r['ttc'], r['distance']; break
-            self.virtual_accel = self.lon_controller.calculate(tttc, tdist, dt); self.draw_virtual_hud(frame, self.virtual_steering, self.virtual_accel)
+            self.virtual_accel = self.lon_controller.calculate(tttc, tdist, dt)
+            self.draw_virtual_hud(frame, self.virtual_steering, self.virtual_accel)
+
+            # UDP packet with enhanced threat level
             try:
-                packet = { "mode": self.mode, "path_center_x": self.drivable_detector.last_path_center_x if self.drivable_detector else None, "frame_w": frame.shape[1], "frame_h": frame.shape[0], "threat_id": tid, "threats": [{ "id": r.get('id'), "dist": r.get('distance'), "ttc": r.get('ttc'), "vx": r.get('vx', 0), "cls": self.classes.get(r.get('class_id', 0), 'obj'), "box": [int(v) for v in r.get('box', [])] } for r in self.last_results], "hazards": last_hazards, "recommended_speed": self.drivable_detector.recommended_speed if self.drivable_detector else "N/A" }
+                packet = {
+                    "mode": self.mode,
+                    "path_center_x": self.drivable_detector.last_path_center_x if self.drivable_detector else None,
+                    "frame_w": frame.shape[1], "frame_h": frame.shape[0],
+                    "threat_id": tid,
+                    "threat_level": int(self._current_threat_level),
+                    "night_mode": self._night_mode_active,
+                    "threats": [{
+                        "id": r.get('id'), "dist": r.get('distance'), "ttc": r.get('ttc'),
+                        "vx": r.get('vx', 0), "cls": self.classes.get(r.get('class_id', 0), 'obj'),
+                        "box": [int(v) for v in r.get('box', [])]
+                    } for r in self.last_results],
+                    "hazards": last_hazards,
+                    "recommended_speed": self.drivable_detector.recommended_speed if self.drivable_detector else "N/A"
+                }
                 self.udp_sock.sendto(json.dumps(packet).encode(), self.udp_target)
-            except: pass
-            self.change_pixmap_signal.emit(frame); self.metrics_signal.emit(self.avg_fps_val, len(self.last_results), lane_status)
+            except Exception as e:
+                logging.debug(f"UDP send error: {e}")
+
+            # Screenshot capture
+            if self.screenshot_requested:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                save_dir = os.path.dirname(os.path.abspath(__file__))
+                path = os.path.join(save_dir, f"astra_capture_{ts}.png")
+                cv2.imwrite(path, frame)
+                self.log_signal.emit(f"Screenshot saved: {path}")
+                self.screenshot_requested = False
+
+            # Video recording
+            if self.recording:
+                if self.video_writer is None:
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    save_dir = os.path.dirname(os.path.abspath(__file__))
+                    path = os.path.join(save_dir, f"astra_rec_{ts}.mp4")
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    self.video_writer = cv2.VideoWriter(path, fourcc, 15, (frame.shape[1], frame.shape[0]))
+                    self.log_signal.emit(f"Recording started: {path}")
+                self.video_writer.write(frame)
+                # Red recording dot
+                cv2.circle(frame, (frame.shape[1] - 30, 90), 10, (0, 0, 255), -1)
+                cv2.putText(frame, "REC", (frame.shape[1] - 65, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            elif self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+                self.log_signal.emit("Recording saved")
+
+            self.change_pixmap_signal.emit(frame)
+            self.metrics_signal.emit(self.avg_fps_val, len(self.last_results), lane_status)
 
     def stop(self):
         self._run_flag = False
         if hasattr(self, 'cap_thread'): self.cap_thread.stop()
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+        try:
+            self.udp_sock.close()
+        except Exception:
+            pass
         self.wait()
 
 class ADASMainWindow(QMainWindow):
     new_ip_cam_signal = pyqtSignal(str)
+    local_cams_signal = pyqtSignal(list)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Astra Perception: AI Lens"); self.setMinimumSize(1200, 950); self.setup_theme()
         self.central_widget = QWidget(); self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
-        self.upper_layout = QHBoxLayout(); self.main_layout.addLayout(self.upper_layout, stretch=6)
         self.threads = {}; self.camera_combos = {}
         self.voice_thread = VoiceAlertThread(); self.voice_thread.start()
+
+        # === TOOLBAR ===
+        self.setup_toolbar()
+
+        # === MAIN CONTENT ===
+        self.upper_layout = QHBoxLayout(); self.main_layout.addLayout(self.upper_layout, stretch=6)
+
+        # Video grid
         self.video_grid = QGridLayout()
         self.main_video = QLabel("<b>PERCEPTION LENS</b><br><small>OFFLINE</small>")
         self.side_video = QLabel("<b>SIDE RADAR</b><br><small>OFFLINE</small>")
@@ -332,6 +525,8 @@ class ADASMainWindow(QMainWindow):
             v.setMinimumSize(400, 300)
         self.video_grid.addWidget(self.main_video, 0, 0, 2, 2); self.video_grid.addWidget(self.side_video, 0, 2); self.video_grid.addWidget(self.rear_video, 1, 2)
         self.upper_layout.addLayout(self.video_grid, stretch=3)
+
+        # Control panel
         self.control_layout = QVBoxLayout()
         global_group = QGroupBox("System Profile"); global_layout = QFormLayout()
         self.vehicle_profile = QComboBox(); self.vehicle_profile.addItems(["Scooter", "Car"])
@@ -339,23 +534,181 @@ class ADASMainWindow(QMainWindow):
         self.setup_camera_controls("Main ADAS", 0, "ADAS", self.main_video)
         self.setup_camera_controls("Side Radar", 1, "BLIND_SPOT", self.side_video)
         self.setup_camera_controls("Rear View", 2, "DRIVER", self.rear_video)
+
+        # === AI SETTINGS PANEL ===
+        self.setup_settings_panel()
+
         self.control_layout.addStretch(); self.upper_layout.addLayout(self.control_layout, stretch=1)
+
+        # === EVENT FEED (Color-coded) ===
         self.event_feed = QTextEdit(); self.event_feed.setReadOnly(True)
         self.event_feed.setStyleSheet("background-color: #050507; color: #00FF00; border: 1px solid #1A1A1F; font-family: 'Consolas', monospace; font-size: 11px; border-radius: 5px;")
         self.event_feed.setPlaceholderText(">> NEURAL EVENT FEED ACTIVE...")
-        self.main_layout.addWidget(QLabel("SYSTEM LOGS"), stretch=0); self.main_layout.addWidget(self.event_feed, stretch=1)
+        feed_label = QLabel("SYSTEM LOGS")
+        feed_label.setStyleSheet("color: #666; font-size: 11px; margin-top: 5px;")
+        self.main_layout.addWidget(feed_label, stretch=0); self.main_layout.addWidget(self.event_feed, stretch=1)
+
+        # === TOAST NOTIFICATION ===
+        self.toast_label = QLabel("")
+        self.toast_label.setStyleSheet("background-color: rgba(200,0,0,200); color: white; font-size: 14px; font-weight: bold; padding: 10px; border-radius: 8px;")
+        self.toast_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.toast_label.setMaximumHeight(45)
+        self.toast_label.hide()
+        self.main_layout.addWidget(self.toast_label)
+        self.toast_timer = QTimer(); self.toast_timer.setSingleShot(True)
+        self.toast_timer.timeout.connect(self.toast_label.hide)
+
+        # === STATUS BAR ===
+        self.setup_status_bar()
+
+        # Camera scanning
         self.new_ip_cam_signal.connect(self.add_ip_camera)
+        self.local_cams_signal.connect(self._update_local_cams)
         threading.Thread(target=self.run_auto_scan, daemon=True).start()
+
+    def setup_toolbar(self):
+        toolbar = QToolBar("Quick Actions")
+        toolbar.setMovable(False)
+        toolbar.setStyleSheet("QToolBar { background-color: #121216; border-bottom: 1px solid #2A2A2E; padding: 2px; spacing: 5px; } QToolButton { background-color: #1A1A1F; color: #00FFFF; border: 1px solid #2A2A2E; border-radius: 4px; padding: 6px 12px; font-weight: bold; font-size: 11px; } QToolButton:hover { background-color: #2A2A2E; border-color: #00FFFF; } QToolButton:checked { background-color: #1A3A3A; border-color: #00FFFF; }")
+        self.addToolBar(toolbar)
+
+        self.act_rec = QAction("REC [Ctrl+R]", self)
+        self.act_rec.setCheckable(True)
+        self.act_rec.triggered.connect(self.toggle_recording)
+        toolbar.addAction(self.act_rec)
+
+        act_screenshot = QAction("CAPTURE [Ctrl+S]", self)
+        act_screenshot.triggered.connect(self.take_screenshot)
+        toolbar.addAction(act_screenshot)
+
+        self.act_night = QAction("NIGHT MODE", self)
+        self.act_night.setCheckable(True)
+        self.act_night.setChecked(True)
+        self.act_night.triggered.connect(self.toggle_night_mode)
+        toolbar.addAction(self.act_night)
+
+        act_detect = QAction("DETECT [Space]", self)
+        act_detect.triggered.connect(self.toggle_detection)
+        toolbar.addAction(act_detect)
+
+    def setup_settings_panel(self):
+        settings_group = QGroupBox("AI Settings")
+        settings_layout = QFormLayout()
+
+        self.conf_slider = QSlider(Qt.Orientation.Horizontal)
+        self.conf_slider.setRange(20, 80); self.conf_slider.setValue(40)
+        self.conf_slider.setStyleSheet("QSlider::groove:horizontal { background: #1A1A1F; height: 6px; border-radius: 3px; } QSlider::handle:horizontal { background: #00FFFF; width: 14px; margin: -4px 0; border-radius: 7px; }")
+        self.conf_label = QLabel("0.40")
+        self.conf_label.setStyleSheet("color: #00FFFF; font-weight: bold;")
+        self.conf_slider.valueChanged.connect(lambda v: (self.conf_label.setText(f"{v/100:.2f}"), self._update_confidence(v)))
+
+        self.alert_slider = QSlider(Qt.Orientation.Horizontal)
+        self.alert_slider.setRange(1, 5); self.alert_slider.setValue(3)
+        self.alert_slider.setStyleSheet("QSlider::groove:horizontal { background: #1A1A1F; height: 6px; border-radius: 3px; } QSlider::handle:horizontal { background: #FF6600; width: 14px; margin: -4px 0; border-radius: 7px; }")
+        self.alert_label = QLabel("3")
+        self.alert_label.setStyleSheet("color: #FF6600; font-weight: bold;")
+        self.alert_slider.valueChanged.connect(lambda v: self.alert_label.setText(str(v)))
+
+        conf_row = QHBoxLayout(); conf_row.addWidget(self.conf_slider); conf_row.addWidget(self.conf_label)
+        alert_row = QHBoxLayout(); alert_row.addWidget(self.alert_slider); alert_row.addWidget(self.alert_label)
+        settings_layout.addRow("Confidence:", conf_row)
+        settings_layout.addRow("Alert Lvl:", alert_row)
+        settings_group.setLayout(settings_layout)
+        self.control_layout.addWidget(settings_group)
+
+    def setup_status_bar(self):
+        sb = self.statusBar()
+        sb.setStyleSheet("QStatusBar { background-color: #0D0D0F; color: #888; font-size: 11px; border-top: 1px solid #1A1A1F; } QStatusBar::item { border: none; }")
+        self.status_fps = QLabel("FPS: --")
+        self.status_fps.setStyleSheet("color: #00FF00; margin-right: 15px;")
+        self.status_gpu = QLabel("GPU: --")
+        self.status_gpu.setStyleSheet("color: #888; margin-right: 15px;")
+        self.status_objects = QLabel("OBJ: 0")
+        self.status_objects.setStyleSheet("color: #00FFFF; margin-right: 15px;")
+        self.status_rec = QLabel("")
+        self.status_rec.setStyleSheet("color: red; font-weight: bold;")
+        self.status_keys = QLabel("Ctrl+R: Record | Ctrl+S: Screenshot | Space: Toggle Detect")
+        self.status_keys.setStyleSheet("color: #444;")
+        sb.addWidget(self.status_fps)
+        sb.addWidget(self.status_gpu)
+        sb.addWidget(self.status_objects)
+        sb.addWidget(self.status_rec)
+        sb.addPermanentWidget(self.status_keys)
+
+    def _update_confidence(self, value):
+        threshold = value / 100.0
+        for name, thread in self.threads.items():
+            if thread.detector:
+                thread.detector.conf_threshold = threshold
+
+    def toggle_recording(self):
+        if "Main ADAS" in self.threads:
+            t = self.threads["Main ADAS"]
+            t.recording = not t.recording
+            self.act_rec.setChecked(t.recording)
+            self.status_rec.setText("REC" if t.recording else "")
+            self.append_log(f"Recording {'STARTED' if t.recording else 'STOPPED'}")
+
+    def take_screenshot(self):
+        if "Main ADAS" in self.threads:
+            self.threads["Main ADAS"].screenshot_requested = True
+            self.append_log("Screenshot captured")
+
+    def toggle_night_mode(self):
+        enabled = self.act_night.isChecked()
+        for name, thread in self.threads.items():
+            thread.night_mode_enabled = enabled
+        self.append_log(f"Night mode {'enabled' if enabled else 'disabled'}")
+
+    def toggle_detection(self):
+        if "Main ADAS" in self.threads:
+            t = self.threads["Main ADAS"]
+            t.enable_objects = not t.enable_objects
+            self.append_log(f"Object detection {'ON' if t.enable_objects else 'OFF'}")
+
+    def show_toast(self, text, duration=3000):
+        self.toast_label.setText(f"  {text}  ")
+        self.toast_label.show()
+        self.toast_timer.start(duration)
+
+    def append_log(self, text):
+        """Color-coded log entry with timestamp"""
+        ts = time.strftime("%H:%M:%S")
+        if any(k in text.upper() for k in ["ERROR", "FAIL", "BRAKE", "URGENT", "COLLISION"]):
+            color = "#FF4444"
+        elif any(k in text.upper() for k in ["ALERT", "WARNING", "CUTTING", "BLIND SPOT"]):
+            color = "#FFAA00"
+        elif any(k in text.upper() for k in ["RECORD", "SCREENSHOT", "STARTED", "STOPPED"]):
+            color = "#00BBFF"
+        else:
+            color = "#00FF00"
+        self.event_feed.append(f'<span style="color:#555">[{ts}]</span> <span style="color:{color}">{text}</span>')
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        mods = event.modifiers()
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_R:
+            self.toggle_recording()
+        elif mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_S:
+            self.take_screenshot()
+        elif key == Qt.Key.Key_Space:
+            self.toggle_detection()
+        else:
+            super().keyPressEvent(event)
 
     def run_auto_scan(self):
         local_cams = list_local_cameras()
         if local_cams:
-            for combo in self.camera_combos.items():
-                current = combo[1].currentText()
-                if not current.startswith("http"):
-                    combo[1].clear(); combo[1].addItems(local_cams)
-                    if current in local_cams: combo[1].setCurrentText(current)
+            self.local_cams_signal.emit(local_cams)
         scan_droidcam(lambda url: self.new_ip_cam_signal.emit(url))
+
+    @pyqtSlot(list)
+    def _update_local_cams(self, local_cams):
+        for name, (mode, qcombo) in self.camera_combos.items():
+            current = qcombo.currentText()
+            if not current.startswith("http"):
+                qcombo.clear(); qcombo.addItems(local_cams)
+                if current in local_cams: qcombo.setCurrentText(current)
 
     @pyqtSlot(str)
     def add_ip_camera(self, url):
@@ -374,7 +727,7 @@ class ADASMainWindow(QMainWindow):
         status_row.addWidget(status_lbl); status_row.addStretch(); status_row.addWidget(QLabel("FPS:")); status_row.addWidget(fps_lbl); layout.addLayout(status_row)
         cb_obj, cb_path, cb_haz = None, None, None
         if mode == "ADAS":
-            toggles = QHBoxLayout(); cb_obj = QCheckBox("Vision"); cb_path = QCheckBox("Path"); cb_path.setChecked(True); cb_haz = QCheckBox("Surface")
+            toggles = QHBoxLayout(); cb_obj = QCheckBox("Vision"); cb_obj.setChecked(True); cb_path = QCheckBox("Path"); cb_path.setChecked(True); cb_haz = QCheckBox("Surface")
             toggles.addWidget(cb_obj); toggles.addWidget(cb_path); toggles.addWidget(cb_haz); layout.addLayout(toggles)
         layout.addWidget(combo); btn_row = QHBoxLayout(); btn_on = QPushButton("ENABLE"); btn_off = QPushButton("DISABLE"); btn_off.setEnabled(False)
         btn_on.clicked.connect(lambda: self.start_cam(name, combo, mode, label, btn_on, btn_off, fps_lbl, status_lbl, cb_obj, cb_path, cb_haz))
@@ -384,6 +737,7 @@ class ADASMainWindow(QMainWindow):
     def start_cam(self, name, combo, mode, label, btn_on, btn_off, fps_lbl, status_lbl, cb_obj, cb_path, cb_haz):
         source = combo.currentText(); v_profile = self.vehicle_profile.currentText()
         thread = CameraThread(source, mode, vehicle_mode=v_profile)
+        thread.night_mode_enabled = self.act_night.isChecked()
         if cb_obj:
             cb_obj.stateChanged.connect(lambda: setattr(thread, 'enable_objects', cb_obj.isChecked()))
             thread.enable_objects = cb_obj.isChecked()
@@ -394,9 +748,15 @@ class ADASMainWindow(QMainWindow):
             cb_haz.stateChanged.connect(lambda: setattr(thread, 'enable_hazards', cb_haz.isChecked()))
             thread.enable_hazards = cb_haz.isChecked()
         thread.change_pixmap_signal.connect(lambda img: self.update_image(label, img))
-        thread.metrics_signal.connect(lambda fps, objs, stat: self.update_metrics(fps, stat, fps_lbl, status_lbl))
-        thread.log_signal.connect(self.event_feed.append); thread.error_signal.connect(lambda err: self.handle_single_cam_error(name, label, status_lbl, btn_on, btn_off, err))
-        thread.voice_alert_signal.connect(self.voice_thread.speak); thread.start(); self.threads[name] = thread; btn_on.setEnabled(False); btn_off.setEnabled(True)
+        thread.metrics_signal.connect(lambda fps, objs, stat: self.update_metrics(fps, objs, stat, fps_lbl, status_lbl))
+        thread.log_signal.connect(self.append_log)
+        thread.error_signal.connect(lambda err: self.handle_single_cam_error(name, label, status_lbl, btn_on, btn_off, err))
+        thread.error_signal.connect(lambda err: self.append_log(f"ERROR [{name}]: {err}"))
+        # Toast for high-level voice alerts
+        thread.voice_alert_signal.connect(lambda text, cd, oid: self.show_toast(text) if cd <= 3 else None)
+        thread.voice_alert_signal.connect(self.voice_thread.speak)
+        thread.start(); self.threads[name] = thread; btn_on.setEnabled(False); btn_off.setEnabled(True)
+        self.append_log(f"{name} camera starting...")
 
     def handle_single_cam_error(self, name, label, status_lbl, btn_on, btn_off, err):
         self.stop_cam(name, None, btn_on, btn_off, label, None, status_lbl)
@@ -413,11 +773,22 @@ class ADASMainWindow(QMainWindow):
         qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
         p = QPixmap.fromImage(qt_img).scaled(label.width(), label.height(), Qt.AspectRatioMode.KeepAspectRatio); label.setPixmap(p)
 
-    def update_metrics(self, fps, status, fps_lbl, status_lbl):
+    def update_metrics(self, fps, obj_count, status, fps_lbl, status_lbl):
         fps_lbl.setText(f"{fps:.1f}"); status_lbl.setText(status)
         if any(x in status for x in ["Warning", "Departure", "Brake"]): status_lbl.setStyleSheet("color: red; font-weight: bold;")
         elif "OK" in status: status_lbl.setStyleSheet("color: green;")
         else: status_lbl.setStyleSheet("color: orange;")
+        # Update status bar
+        self.status_fps.setText(f"FPS: {fps:.1f}")
+        self.status_objects.setText(f"OBJ: {obj_count}")
+        # Check GPU status once
+        if self.status_gpu.text() == "GPU: --":
+            for t in self.threads.values():
+                if t.detector:
+                    gpu_on = t.detector.device == 'cuda'
+                    self.status_gpu.setText(f"GPU: {'ON' if gpu_on else 'OFF'}")
+                    self.status_gpu.setStyleSheet(f"color: {'#00FF00' if gpu_on else '#FF6600'}; margin-right: 15px;")
+                    break
 
     def setup_theme(self):
         self.setStyleSheet("""QMainWindow { background-color: #0A0A0C; } QWidget { background-color: #0A0A0C; color: #E0E0E0; font-family: 'Segoe UI', sans-serif; } QGroupBox { border: 1px solid #2A2A2E; border-radius: 8px; margin-top: 15px; font-weight: bold; color: #00FFFF; background-color: #121216; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; } QPushButton { background-color: #1F1F23; color: #E0E0E0; border: 1px solid #3A3A3F; padding: 8px; border-radius: 5px; font-weight: bold; } QPushButton:hover { background-color: #2A2A2E; border: 1px solid #00FFFF; } QPushButton:disabled { background-color: #0D0D0F; color: #444; } QComboBox { background-color: #1F1F23; border: 1px solid #3A3A3F; border-radius: 4px; padding: 5px; color: white; } QCheckBox { spacing: 5px; } QCheckBox::indicator { width: 15px; height: 15px; }""")
@@ -427,4 +798,17 @@ class ADASMainWindow(QMainWindow):
         self.voice_thread.stop(); super().closeEvent(event)
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv); window = ADASMainWindow(); window.show(); sys.exit(app.exec())
+    # Single-instance guard using lock file
+    import fcntl
+    lock_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".astra.lock")
+    fp = open(lock_file, 'w')
+    try:
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print("Astra Perception is already running.")
+        sys.exit(0)
+
+    app = QApplication(sys.argv)
+    window = ADASMainWindow()
+    window.show()
+    sys.exit(app.exec())
