@@ -1,0 +1,7 @@
+README.md
+setup.py
+astra_core.egg-info/PKG-INFO
+astra_core.egg-info/SOURCES.txt
+astra_core.egg-info/dependency_links.txt
+astra_core.egg-info/top_level.txt
+src/controllers.cpp

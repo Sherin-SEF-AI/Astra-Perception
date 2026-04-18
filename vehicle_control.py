@@ -367,6 +367,10 @@ class ECUDashboard(QMainWindow):
         layout.addLayout(right_panel, stretch=2)
 
     def process_packet(self, packet):
+        # Basic packet validation
+        if not isinstance(packet, dict) or "threats" not in packet:
+            return
+
         self.last_packet_time = time.time()
         self.status_lbl.setText("ECU CONNECTED")
         self.status_lbl.setStyleSheet("color: #00FF00; font-size: 18px; font-weight: bold;")
